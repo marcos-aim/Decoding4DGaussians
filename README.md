@@ -1,6 +1,6 @@
 # Decoding4DGaussians
 
-Feed-forward dynamic 3D Gaussian splatting from monocular video. A frozen SpaTrackerV2 backbone extracts per-frame tokens and 3D point maps, which MLP decoder heads convert into dynamic Gaussians — no per-scene optimization required.
+Feed-forward dynamic 3D Gaussian splatting from monocular video. A frozen SpaTrackerV2 backbone extracts per-frame tokens and 3D point maps, which learnable decoder heads convert into dynamic Gaussians — no per-scene optimization required.
 
 ## Setup
 
@@ -33,28 +33,33 @@ datasets/neu3d/coffee_martini/
 Each experiment lives in `experiments/<name>/` with a `config.yaml` and `src/` directory.
 
 ```bash
-cd experiments/overfit_highres_highcount_coffee_martini
-
 # 1. Precompute SpaTrackerV2 features (once per scene/resolution)
-python src/precompute.py --scene_dir ../../datasets/neu3d/coffee_martini --cache_dir cache
+python experiments/overfit_coffee_martini/src/precompute.py --scene coffee_martini
 
 # 2. Train (3 stages: canonical -> deformation -> joint)
-python src/train.py
+python experiments/<experiment>/src/train.py --config experiments/<experiment>/config.yaml
 
 # 3. Evaluate (renders video, computes PSNR/SSIM, exports PLY)
-python src/eval.py
-
-# 4. Interactive viewer (opens at http://localhost:8080)
-python src/viewer.py
+python experiments/<experiment>/src/eval.py --config experiments/<experiment>/config.yaml
 ```
 
 Edit `config.yaml` to change resolution, Gaussian count (K), learning rates, and training schedule.
 
 ## Experiments
 
-| Directory | Resolution | K | Description |
-|---|---|---|---|
-| `overfit_coffee_martini` | 512x384 | 128 | Baseline with aggregator-only deformation |
-| `overfit_cross_attn_coffee_martini` | 512x384 | 128 | Cross-attention deformation head |
-| `overfit_highres_cross_attn_coffee_martini` | 1024x768 | 128 | High-res with resolution-aware scaling |
-| `overfit_highres_highcount_coffee_martini` | 1024x768 | 512 | High-res + 4x Gaussians (best quality) |
+| Experiment | Resolution | K | Mean PSNR | Min PSNR | Status |
+|---|---|---|---|---|---|
+| `overfit_coffee_martini` | 512x384 | 128 | 24.52 | 23.70 | Done |
+| `overfit_cross_attn_coffee_martini` | 512x384 | 128 | 24.61 | 24.14 | Done (primary baseline) |
+| `overfit_highres_cross_attn_coffee_martini` | 1024x768 | 128 | 24.06 | 23.54 | Done |
+| `overfit_highres_highcount_coffee_martini` | 1024x768 | 512 | 24.74 | 24.20 | Done |
+| `overfit_sh1_cross_attn_coffee_martini` | 512x384 | 128 | 24.66 | 22.92 | Done |
+| `overfit_depthloss_cross_attn_coffee_martini` | 512x384 | 128 | 24.55 | 23.99 | Done |
+| **`overfit_k64_cross_attn_coffee_martini`** | 512x384 | **64** | **25.20** | **24.51** | **Done (best)** |
+| `overfit_contig4_cross_attn_coffee_martini` | 512x384 | 128 | 23.76 | 23.05 | Stage 2 only |
+| `overfit_k256_cross_attn_coffee_martini` | 512x384 | 256 | — | — | Ready |
+| `overfit_coordnorm_hybrid_cross_attn_coffee_martini` | 512x384 | 128 | — | — | Ready |
+| `overfit_dpt_full_cross_attn_coffee_martini` | 512x384 | 128 | — | — | Ready |
+| `overfit_dpt_hybrid_cross_attn_coffee_martini` | 512x384 | 128 | — | — | Ready |
+
+Full results with per-experiment lessons in [`experiments/leaderboard.csv`](experiments/leaderboard.csv).

@@ -36,6 +36,7 @@ gaussian-splatting/
 ReconDrive/
 dggt/
 worldsplat/
+Depth-Anything-3/
 
 # OS
 .DS_Store
