@@ -1,0 +1,48 @@
+# Datasets
+datasets/
+
+# Experiment outputs
+experiments/*/cache/
+experiments/*/checkpoints/
+experiments/*/renders/
+experiments/*/logs/
+experiments/*/results_*/
+experiments/*/*.log
+experiments/*/launch_after.sh
+experiments/*/watcher.log
+experiments/*/results_summary.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
+
+# AI / editor / docs
+CLAUDE.md
+IDEAS.md
+PLAN.md
+DATASET_DOWNLOAD_PROMPT.md
+OVERNIGHT_EXPERIMENT_PROMPT.md
+docs/
+tools/
+.claude/
+
+# Reference repos (not submodules)
+gaussian-splatting/
+ReconDrive/
+dggt/
+worldsplat/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Virtual environments
+.venv/
+venv/

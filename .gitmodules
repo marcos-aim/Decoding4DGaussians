@@ -1,0 +1,6 @@
+[submodule "SpaTrackerV2"]
+	path = SpaTrackerV2
+	url = https://github.com/henry123-boy/SpaTrackerV2.git
+[submodule "4DGaussians"]
+	path = 4DGaussians
+	url = https://github.com/hustvl/4DGaussians.git

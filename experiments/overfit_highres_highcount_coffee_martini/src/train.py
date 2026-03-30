@@ -1,0 +1,500 @@
+"""Unified training: Stage 1 canonical + Stage 2/3 cross-attention deformation.
+
+High-resolution version (1024x768). All 3 stages from scratch.
+"""
+
+import math
+import os
+import sys
+import glob
+import time
+import yaml
+import torch
+import torch.optim as optim
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+
+from cameras import build_cameras_from_llff
+from dataset import CachedSceneDataset
+from model import CanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
+from renderer import render_gaussians
+from losses import photometric_loss, compute_psnr, scale_regularization, opacity_regularization
+
+
+def get_vram_gb():
+    alloc = torch.cuda.memory_allocated() / 1e9
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    return alloc, peak
+
+
+def save_checkpoint(path, step, canonical_head, deformation_head, optimizer):
+    torch.save({
+        "step": step,
+        "canonical_head": canonical_head.state_dict(),
+        "deformation_head": deformation_head.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }, path)
+
+
+def save_render(rendered, path):
+    import cv2
+    img = (rendered.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(path, img)
+
+
+def tv_loss(deltas_t, deltas_prev):
+    return (deltas_t - deltas_prev).pow(2).mean()
+
+
+def build_heads(cfg, dataset):
+    P = dataset.num_patches
+    K = cfg["model"].get("num_gaussians_per_patch", 1)
+    pts_mean = dataset.points_map.mean(dim=0)
+    H, W = pts_mean.shape[0], pts_mean.shape[1]
+    pts_flat = pts_mean.reshape(-1, 3)
+
+    grid_w = round((P * W / H) ** 0.5)
+    grid_h = round(P / grid_w)
+    while grid_w * grid_h < P:
+        grid_w += 1
+
+    patch_h = H / grid_h
+    patch_w = W / grid_w
+    pixel_y = torch.arange(H).float()
+    pixel_x = torch.arange(W).float()
+    yy, xx = torch.meshgrid(pixel_y, pixel_x, indexing="ij")
+    patch_idx_y = (yy / patch_h).long().clamp(0, grid_h - 1)
+    patch_idx_x = (xx / patch_w).long().clamp(0, grid_w - 1)
+    pixel_to_patch = (patch_idx_y * grid_w + patch_idx_x).reshape(-1)
+
+    init_xyz_per_gaussian = torch.zeros(P, K, 3)
+    for p in range(P):
+        mask = (pixel_to_patch == p)
+        pts_p = pts_flat[mask]
+        if pts_p.shape[0] == 0:
+            init_xyz_per_gaussian[p] = pts_flat.mean(dim=0).unsqueeze(0).expand(K, -1)
+        elif pts_p.shape[0] >= K:
+            idx = torch.linspace(0, pts_p.shape[0] - 1, K).long()
+            init_xyz_per_gaussian[p] = pts_p[idx]
+        else:
+            repeats = K // pts_p.shape[0] + 1
+            init_xyz_per_gaussian[p] = pts_p.repeat(repeats, 1)[:K]
+    init_xyz_per_gaussian = init_xyz_per_gaussian.reshape(P * K, 3)
+
+    indices = torch.linspace(0, pts_flat.shape[0] - 1, P).long()
+    init_xyz = pts_flat[indices]
+
+    print(f"  Patch grid: {grid_h}x{grid_w}, P={P}, K={K}, total Gaussians={P*K}")
+
+    # Resolution-aware hyperparameters (calibrated at REF_W=512)
+    REF_W = 512
+    res_scale = REF_W / W  # 1.0 at 512, 0.5 at 1024
+    init_log_scale = math.log(0.5 * res_scale)
+    spread = 0.05 * res_scale
+    ssim_win_size = max(11, round(11 / res_scale)) | 1  # must be odd
+    print(f"  Resolution scaling: W={W}, res_scale={res_scale:.2f}")
+    print(f"  Scale init: log({0.5 * res_scale:.3f}) = {init_log_scale:.3f}")
+    print(f"  Spread: {spread:.4f}, SSIM win: {ssim_win_size}")
+
+    canonical_head = CanonicalGaussianHead(
+        dim_in=cfg["model"]["canonical"]["dim_in"],
+        dim_hidden=cfg["model"]["canonical"]["dim_hidden"],
+        sh_degree=cfg["model"]["canonical"]["sh_degree"],
+        init_xyz=init_xyz,
+        num_gaussians_per_patch=K,
+        init_xyz_per_gaussian=init_xyz_per_gaussian,
+        init_log_scale=init_log_scale,
+        spread=spread,
+    ).cuda()
+
+    defo_cfg = cfg["model"]["deformation"]
+    deformation_head = CrossAttentionDeformationHead(
+        dim_canonical=defo_cfg["dim_canonical"],
+        dim_tokens=defo_cfg["dim_tokens"],
+        dim_hidden=defo_cfg["dim_hidden"],
+        n_heads=defo_cfg["n_heads"],
+        n_layers=defo_cfg["n_layers"],
+        sh_degree=cfg["model"]["canonical"]["sh_degree"],
+        num_gaussians_per_patch=K,
+        max_displacement=defo_cfg.get("max_displacement", 2.0),
+    ).cuda()
+
+    print(f"  CanonicalHead: {sum(p.numel() for p in canonical_head.parameters())/1e6:.1f}M params")
+    print(f"  CrossAttentionDeformHead: {sum(p.numel() for p in deformation_head.parameters())/1e6:.1f}M params")
+
+    return canonical_head, deformation_head, res_scale, ssim_win_size
+
+
+def train(config_path: str, resume_stage: int = 1):
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    cache_dir = cfg["paths"]["cache_dir"]
+    ckpt_dir = cfg["paths"]["checkpoint_dir"]
+    render_dir = cfg["paths"]["render_dir"]
+    log_dir = cfg["paths"]["log_dir"]
+
+    os.makedirs(ckpt_dir, exist_ok=True)
+    for s in ["stage1", "stage2", "stage3"]:
+        os.makedirs(os.path.join(render_dir, s), exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    target_w, target_h = cfg["data"]["resolution"]
+    total_vram = cfg["vram"]["total_gb"]
+    scene_dir = cfg["paths"]["neu3d_scene"]
+    cam_files = sorted([os.path.basename(f) for f in glob.glob(os.path.join(scene_dir, "cam*.mp4"))])
+    cameras = build_cameras_from_llff(
+        os.path.join(scene_dir, "poses_bounds.npy"), target_w, target_h, cam_files
+    )
+
+    dataset = CachedSceneDataset(
+        cache_dir, cameras,
+        input_camera=cfg["data"]["input_camera"],
+        eval_camera=cfg["data"]["eval_camera"],
+    )
+
+    canonical_head, deformation_head, res_scale, ssim_win_size = build_heads(cfg, dataset)
+
+    bg_color = torch.zeros(3, device="cuda")
+    sh_degree = cfg["model"]["canonical"]["sh_degree"]
+    scale_anneal_target = cfg["training"].get("scale_anneal_target", 1.0)
+    grad_clip = cfg["training"].get("grad_clip_max_norm", 0.0)
+    batch_frames = cfg["training"]["batch_frames"]
+    supervision_cams = cfg["training"]["supervision_cams"]
+    eval_cam_name = cfg["data"]["eval_camera"]
+
+    writer = SummaryWriter(log_dir)
+    start_time = time.time()
+
+    # ===== STAGE 1: Canonical Head =====
+    if resume_stage <= 1:
+        print("\n" + "=" * 60)
+        print("STAGE 1: Training Canonical Head (static scene)")
+        print("=" * 60)
+
+        deformation_head.eval()
+        for p in deformation_head.parameters():
+            p.requires_grad = False
+
+        canonical_head.train()
+        s1_cfg = cfg["training"]["stage1"]
+        s1_weights = s1_cfg["loss_weights"]
+
+        optimizer_s1 = optim.AdamW(canonical_head.parameters(), lr=s1_cfg["lr"])
+        scheduler_s1 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s1, T_max=s1_cfg["steps"])
+        torch.cuda.reset_peak_memory_stats()
+
+        pbar = tqdm(range(s1_cfg["steps"]), desc="Stage 1 (Canonical)")
+        for step in pbar:
+            optimizer_s1.zero_grad()
+
+            batch = dataset.sample_training_batch(batch_frames, supervision_cams)
+            tokens_mean = batch["tokens_mean"].cuda()
+            canonical = canonical_head(tokens_mean)
+            means3D, scales, rotations, opacity, shs = compose_gaussians(
+                canonical, scale_factor=scale_anneal_target
+            )
+
+            total_loss = torch.tensor(0.0, device="cuda")
+            total_psnr = 0.0
+            num_renders = 0
+
+            for cam_name in batch["cam_names"]:
+                cam = cameras[cam_name]
+                for i in range(len(batch["frame_indices"])):
+                    gt = batch["gt_images"][cam_name][i].cuda()
+                    rendered, _, _, _ = render_gaussians(
+                        means3D, scales, rotations, opacity, shs, cam, bg_color, sh_degree
+                    )
+                    total_loss = total_loss + s1_weights["rgb"] * photometric_loss(
+                        rendered, gt, lambda_ssim=s1_weights["ssim"], win_size=ssim_win_size
+                    )
+                    total_psnr += compute_psnr(rendered, gt)
+                    num_renders += 1
+
+            total_loss = total_loss / max(num_renders, 1)
+            avg_psnr = total_psnr / max(num_renders, 1)
+
+            if s1_weights.get("scale_reg", 0) > 0:
+                total_loss = total_loss + s1_weights["scale_reg"] * res_scale * scale_regularization(scales)
+            if s1_weights.get("opacity_reg", 0) > 0:
+                total_loss = total_loss + s1_weights["opacity_reg"] * opacity_regularization(opacity)
+
+            if torch.isnan(total_loss):
+                print(f"\n[ABORT] NaN at step {step}!")
+                return
+
+            total_loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(canonical_head.parameters(), grad_clip)
+            optimizer_s1.step()
+            scheduler_s1.step()
+
+            vram_alloc, _ = get_vram_gb()
+            pbar.set_postfix({"loss": f"{total_loss.item():.4f}", "psnr": f"{avg_psnr:.1f}",
+                               "vram": f"{vram_alloc:.1f}/{total_vram:.0f}GB"})
+            writer.add_scalar("stage1/loss", total_loss.item(), step)
+            writer.add_scalar("stage1/psnr", avg_psnr, step)
+
+            if step % cfg["training"]["checkpointing"]["render_every"] == 0:
+                save_render(rendered, os.path.join(render_dir, "stage1", f"step_{step:05d}.jpg"))
+            if step % cfg["training"]["checkpointing"]["save_every"] == 0 and step > 0:
+                save_checkpoint(os.path.join(ckpt_dir, f"stage1_step{step}.pt"),
+                                step, canonical_head, deformation_head, optimizer_s1)
+
+            if step % 1000 == 0:
+                with torch.no_grad():
+                    eval_cam = cameras[eval_cam_name]
+                    tokens_mean_eval = dataset.get_tokens_mean().cuda()
+                    canonical_eval = canonical_head(tokens_mean_eval)
+                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, scale_factor=scale_anneal_target)
+                    gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
+                    rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
+                    novel_psnr = compute_psnr(rendered_novel, gt_novel)
+                    writer.add_scalar("stage1/novel_psnr", novel_psnr, step)
+                    tqdm.write(f"  Step {step}: train={avg_psnr:.2f}, novel={novel_psnr:.2f} dB")
+                    save_render(rendered_novel, os.path.join(render_dir, "stage1", f"novel_{step:05d}.jpg"))
+
+        save_checkpoint(os.path.join(ckpt_dir, "stage1_final.pt"),
+                        s1_cfg["steps"], canonical_head, deformation_head, optimizer_s1)
+        print(f"\nStage 1 complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
+        torch.cuda.empty_cache()
+
+    # ===== STAGE 2: Cross-Attention Deformation =====
+    if resume_stage <= 2:
+        if resume_stage == 2:
+            ckpt = torch.load(os.path.join(ckpt_dir, "stage1_final.pt"), weights_only=False)
+            canonical_head.load_state_dict(ckpt["canonical_head"])
+
+        print("\n" + "=" * 60)
+        print("STAGE 2: Training Cross-Attention Deformation Head")
+        print("=" * 60)
+
+        canonical_head.eval()
+        for p in canonical_head.parameters():
+            p.requires_grad = False
+        deformation_head.train()
+        for p in deformation_head.parameters():
+            p.requires_grad = True
+
+        s2_cfg = cfg["training"]["stage2"]
+        s2_weights = s2_cfg["loss_weights"]
+        optimizer_s2 = optim.AdamW(deformation_head.parameters(), lr=s2_cfg["lr"])
+        scheduler_s2 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s2, T_max=s2_cfg["steps"])
+        torch.cuda.reset_peak_memory_stats()
+
+        pbar = tqdm(range(s2_cfg["steps"]), desc="Stage 2 (CrossAttn Defo)")
+        for step in pbar:
+            optimizer_s2.zero_grad()
+
+            batch = dataset.sample_training_batch(batch_frames, supervision_cams)
+            tokens_mean = batch["tokens_mean"].cuda()
+            with torch.no_grad():
+                canonical = canonical_head(tokens_mean)
+
+            total_loss = torch.tensor(0.0, device="cuda")
+            total_psnr = 0.0
+            prev_deltas_flat = None
+
+            for i, fidx in enumerate(batch["frame_indices"]):
+                tokens_t = batch["tokens_frames"][i].cuda()
+                deltas = deformation_head(canonical["hidden"], tokens_t)
+                means3D, scales, rotations, opacity, shs = compose_gaussians(
+                    canonical, deltas, scale_factor=scale_anneal_target
+                )
+                for cam_name in batch["cam_names"]:
+                    cam = cameras[cam_name]
+                    gt = batch["gt_images"][cam_name][i].cuda()
+                    rendered, _, _, _ = render_gaussians(
+                        means3D, scales, rotations, opacity, shs, cam, bg_color, sh_degree
+                    )
+                    total_loss = total_loss + s2_weights["rgb"] * photometric_loss(
+                        rendered, gt, lambda_ssim=s2_weights["ssim"], win_size=ssim_win_size
+                    )
+                    total_psnr += compute_psnr(rendered, gt)
+
+                deltas_flat = torch.cat([deltas["dxyz"].reshape(-1), deltas["dscale"].reshape(-1),
+                                         deltas["opacity_logit"].reshape(-1)], dim=0)
+                if prev_deltas_flat is not None:
+                    total_loss = total_loss + s2_weights["tv"] * tv_loss(deltas_flat, prev_deltas_flat)
+                prev_deltas_flat = deltas_flat.detach()
+
+            num_renders = len(batch["frame_indices"]) * len(batch["cam_names"])
+            total_loss = total_loss / max(num_renders, 1)
+            avg_psnr = total_psnr / max(num_renders, 1)
+
+            if s2_weights.get("scale_reg", 0) > 0:
+                total_loss = total_loss + s2_weights["scale_reg"] * res_scale * scale_regularization(scales)
+            if s2_weights.get("opacity_reg", 0) > 0:
+                total_loss = total_loss + s2_weights["opacity_reg"] * opacity_regularization(opacity)
+
+            if torch.isnan(total_loss):
+                print(f"\n[ABORT] NaN at step {step}!")
+                return
+
+            total_loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(deformation_head.parameters(), grad_clip)
+            optimizer_s2.step()
+            scheduler_s2.step()
+
+            vram_alloc, _ = get_vram_gb()
+            pbar.set_postfix({"loss": f"{total_loss.item():.4f}", "psnr": f"{avg_psnr:.1f}",
+                               "vram": f"{vram_alloc:.1f}/{total_vram:.0f}GB"})
+            writer.add_scalar("stage2/loss", total_loss.item(), step)
+            writer.add_scalar("stage2/psnr", avg_psnr, step)
+
+            if step % cfg["training"]["checkpointing"]["render_every"] == 0:
+                save_render(rendered, os.path.join(render_dir, "stage2", f"step_{step:05d}.jpg"))
+            if step % cfg["training"]["checkpointing"]["save_every"] == 0 and step > 0:
+                save_checkpoint(os.path.join(ckpt_dir, f"stage2_step{step}.pt"),
+                                step, canonical_head, deformation_head, optimizer_s2)
+
+            if step % 1000 == 0:
+                with torch.no_grad():
+                    eval_cam = cameras[eval_cam_name]
+                    tokens_mean_eval = dataset.get_tokens_mean().cuda()
+                    canonical_eval = canonical_head(tokens_mean_eval)
+                    tokens_t_eval = dataset.get_tokens_frame(0).cuda()
+                    deltas_eval = deformation_head(canonical_eval["hidden"], tokens_t_eval)
+                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval, scale_factor=scale_anneal_target)
+                    gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
+                    rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
+                    novel_psnr = compute_psnr(rendered_novel, gt_novel)
+                    writer.add_scalar("stage2/novel_psnr", novel_psnr, step)
+                    tqdm.write(f"  Step {step}: train={avg_psnr:.2f}, novel={novel_psnr:.2f} dB")
+                    save_render(rendered_novel, os.path.join(render_dir, "stage2", f"novel_{step:05d}.jpg"))
+
+        save_checkpoint(os.path.join(ckpt_dir, "stage2_final.pt"),
+                        s2_cfg["steps"], canonical_head, deformation_head, optimizer_s2)
+        print(f"\nStage 2 complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
+        torch.cuda.empty_cache()
+
+    # ===== STAGE 3: Joint Fine-tuning =====
+    if "stage3" in cfg["training"]:
+        if resume_stage >= 3:
+            ckpt = torch.load(os.path.join(ckpt_dir, "stage2_final.pt"), weights_only=False)
+            canonical_head.load_state_dict(ckpt["canonical_head"])
+            deformation_head.load_state_dict(ckpt["deformation_head"])
+
+        print("\n" + "=" * 60)
+        print("STAGE 3: Joint Fine-tuning (Both Heads)")
+        print("=" * 60)
+
+        canonical_head.train()
+        deformation_head.train()
+        for p in canonical_head.parameters():
+            p.requires_grad = True
+
+        s3_cfg = cfg["training"]["stage3"]
+        s3_weights = s3_cfg["loss_weights"]
+        optimizer_s3 = optim.AdamW(
+            list(canonical_head.parameters()) + list(deformation_head.parameters()),
+            lr=s3_cfg["lr"],
+        )
+        scheduler_s3 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s3, T_max=s3_cfg["steps"])
+        torch.cuda.reset_peak_memory_stats()
+
+        pbar = tqdm(range(s3_cfg["steps"]), desc="Stage 3 (Joint)")
+        for step in pbar:
+            optimizer_s3.zero_grad()
+
+            batch = dataset.sample_training_batch(batch_frames, supervision_cams)
+            tokens_mean = batch["tokens_mean"].cuda()
+            canonical = canonical_head(tokens_mean)
+
+            total_loss = torch.tensor(0.0, device="cuda")
+            total_psnr = 0.0
+            prev_deltas_flat = None
+
+            for i, fidx in enumerate(batch["frame_indices"]):
+                tokens_t = batch["tokens_frames"][i].cuda()
+                deltas = deformation_head(canonical["hidden"], tokens_t)
+                means3D, scales, rotations, opacity, shs = compose_gaussians(
+                    canonical, deltas, scale_factor=scale_anneal_target
+                )
+                for cam_name in batch["cam_names"]:
+                    cam = cameras[cam_name]
+                    gt = batch["gt_images"][cam_name][i].cuda()
+                    rendered, _, _, _ = render_gaussians(
+                        means3D, scales, rotations, opacity, shs, cam, bg_color, sh_degree
+                    )
+                    total_loss = total_loss + s3_weights["rgb"] * photometric_loss(
+                        rendered, gt, lambda_ssim=s3_weights["ssim"], win_size=ssim_win_size
+                    )
+                    total_psnr += compute_psnr(rendered, gt)
+
+                deltas_flat = torch.cat([deltas["dxyz"].reshape(-1), deltas["dscale"].reshape(-1),
+                                         deltas["opacity_logit"].reshape(-1)], dim=0)
+                if prev_deltas_flat is not None:
+                    total_loss = total_loss + s3_weights["tv"] * tv_loss(deltas_flat, prev_deltas_flat)
+                prev_deltas_flat = deltas_flat.detach()
+
+            num_renders = len(batch["frame_indices"]) * len(batch["cam_names"])
+            total_loss = total_loss / max(num_renders, 1)
+            avg_psnr = total_psnr / max(num_renders, 1)
+
+            if s3_weights.get("scale_reg", 0) > 0:
+                total_loss = total_loss + s3_weights["scale_reg"] * res_scale * scale_regularization(scales)
+            if s3_weights.get("opacity_reg", 0) > 0:
+                total_loss = total_loss + s3_weights["opacity_reg"] * opacity_regularization(opacity)
+
+            if torch.isnan(total_loss):
+                print(f"\n[ABORT] NaN at step {step}!")
+                break
+
+            total_loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(canonical_head.parameters()) + list(deformation_head.parameters()), grad_clip)
+            optimizer_s3.step()
+            scheduler_s3.step()
+
+            vram_alloc, _ = get_vram_gb()
+            pbar.set_postfix({"loss": f"{total_loss.item():.4f}", "psnr": f"{avg_psnr:.1f}",
+                               "vram": f"{vram_alloc:.1f}/{total_vram:.0f}GB"})
+            writer.add_scalar("stage3/loss", total_loss.item(), step)
+            writer.add_scalar("stage3/psnr", avg_psnr, step)
+
+            if step % cfg["training"]["checkpointing"]["render_every"] == 0:
+                save_render(rendered, os.path.join(render_dir, "stage3", f"step_{step:05d}.jpg"))
+            if step % cfg["training"]["checkpointing"]["save_every"] == 0 and step > 0:
+                save_checkpoint(os.path.join(ckpt_dir, f"stage3_step{step}.pt"),
+                                step, canonical_head, deformation_head, optimizer_s3)
+
+            if step % 1000 == 0:
+                with torch.no_grad():
+                    eval_cam = cameras[eval_cam_name]
+                    tokens_mean_eval = dataset.get_tokens_mean().cuda()
+                    canonical_eval = canonical_head(tokens_mean_eval)
+                    tokens_t_eval = dataset.get_tokens_frame(0).cuda()
+                    deltas_eval = deformation_head(canonical_eval["hidden"], tokens_t_eval)
+                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval, scale_factor=scale_anneal_target)
+                    gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
+                    rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
+                    novel_psnr = compute_psnr(rendered_novel, gt_novel)
+                    writer.add_scalar("stage3/novel_psnr", novel_psnr, step)
+                    tqdm.write(f"  Step {step}: train={avg_psnr:.2f}, novel={novel_psnr:.2f} dB")
+                    save_render(rendered_novel, os.path.join(render_dir, "stage3", f"novel_{step:05d}.jpg"))
+
+        save_checkpoint(os.path.join(ckpt_dir, "stage3_final.pt"),
+                        s3_cfg["steps"], canonical_head, deformation_head, optimizer_s3)
+        print(f"\nStage 3 complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
+
+    elapsed = time.time() - start_time
+    writer.close()
+    print(f"\nTotal training time: {elapsed/3600:.1f}h ({elapsed:.0f}s)")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str,
+                        default="D:/DecodeGaussians/experiments/overfit_highres_highcount_coffee_martini/config.yaml")
+    parser.add_argument("--resume-stage", type=int, default=1,
+                        help="1=full run, 2=skip stage1, 3=joint only")
+    args = parser.parse_args()
+    train(args.config, resume_stage=args.resume_stage)
