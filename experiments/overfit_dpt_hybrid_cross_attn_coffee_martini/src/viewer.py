@@ -1,10 +1,11 @@
-"""Interactive 3D Gaussian viewer for cross-attention model using viser.
+"""Interactive 3D Gaussian viewer for H2 hybrid DPT model using viser.
 
-Loads the trained cross-attention decoder model and renders Gaussians in real-time.
+Loads the trained hybrid DPT+MLP decoder model and renders Gaussians in real-time.
 Navigate with mouse, scrub through frames with a slider.
 Open http://localhost:8080 in your browser.
 """
 
+import math
 import os
 import sys
 import glob
@@ -17,13 +18,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from cameras import build_cameras_from_llff
 from dataset import CachedSceneDataset
-from model import CanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
+from model import HybridDPTCanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
 
 import viser
 
 
 def load_model(config_path: str, checkpoint_path: str = None):
-    """Load trained cross-attention model and return everything needed for rendering."""
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -40,7 +40,7 @@ def load_model(config_path: str, checkpoint_path: str = None):
     dataset = CachedSceneDataset(cache_dir, cameras)
 
     P = dataset.num_patches
-    K = cfg["model"].get("num_gaussians_per_patch", 1)
+    K = cfg["model"].get("num_gaussians_per_patch", 128)
     pts_mean = dataset.points_map.mean(dim=0)
     H, W = pts_mean.shape[0], pts_mean.shape[1]
     pts_flat = pts_mean.reshape(-1, 3)
@@ -76,13 +76,28 @@ def load_model(config_path: str, checkpoint_path: str = None):
     indices = torch.linspace(0, pts_flat.shape[0] - 1, P).long()
     init_xyz = pts_flat[indices]
 
-    canonical_head = CanonicalGaussianHead(
-        dim_in=cfg["model"]["canonical"]["dim_in"],
-        dim_hidden=cfg["model"]["canonical"]["dim_hidden"],
-        sh_degree=cfg["model"]["canonical"]["sh_degree"],
-        init_xyz=init_xyz,
+    REF_W = 512
+    res_scale = REF_W / W
+    init_log_scale = math.log(0.5 * res_scale)
+    spread = 0.05 * res_scale
+
+    can_cfg = cfg["model"]["canonical"]
+    dpt_dim = can_cfg.get("dpt_dim", 512)
+    cfg_grid_h = can_cfg.get("grid_h", grid_h)
+    cfg_grid_w = can_cfg.get("grid_w", grid_w)
+
+    canonical_head = HybridDPTCanonicalGaussianHead(
+        dim_in=can_cfg["dim_in"],
+        dim_hidden=can_cfg["dim_hidden"],
+        grid_h=cfg_grid_h,
+        grid_w=cfg_grid_w,
+        sh_degree=can_cfg["sh_degree"],
         num_gaussians_per_patch=K,
+        init_xyz=init_xyz,
         init_xyz_per_gaussian=init_xyz_per_gaussian,
+        init_log_scale=init_log_scale,
+        spread=spread,
+        dpt_dim=dpt_dim,
     ).cuda()
 
     defo_cfg = cfg["model"]["deformation"]
@@ -92,7 +107,7 @@ def load_model(config_path: str, checkpoint_path: str = None):
         dim_hidden=defo_cfg["dim_hidden"],
         n_heads=defo_cfg["n_heads"],
         n_layers=defo_cfg["n_layers"],
-        sh_degree=cfg["model"]["canonical"]["sh_degree"],
+        sh_degree=can_cfg["sh_degree"],
         num_gaussians_per_patch=K,
         max_displacement=defo_cfg.get("max_displacement", 2.0),
     ).cuda()
@@ -116,12 +131,12 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str,
-                        default="D:/DecodeGaussians/experiments/overfit_cross_attn_coffee_martini/config.yaml")
+                        default="D:/DecodeGaussians/experiments/overfit_dpt_hybrid_cross_attn_coffee_martini/config.yaml")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
-    print("Loading cross-attention model...")
+    print("Loading H2 hybrid DPT model...")
     canonical_head, deformation_head, dataset, cfg, scale_anneal_target = load_model(
         args.config, args.checkpoint
     )
@@ -137,13 +152,11 @@ def main():
     playing = server.gui.add_checkbox("Play", initial_value=False)
     fps_slider = server.gui.add_slider("FPS", min=1, max=60, step=1, initial_value=15)
 
-    # Precompute all frames
     print("Precomputing Gaussians for all frames...")
     frame_cache = {}
     with torch.no_grad():
         tokens_mean = dataset.get_tokens_mean().cuda()
         canonical = canonical_head(tokens_mean)
-        # Keep hidden on CPU to reduce VRAM pressure during loop
         canonical_hidden_cpu = canonical["hidden"].cpu()
         for fi in range(num_frames):
             tokens_t = dataset.get_tokens_frame(fi).cuda()
@@ -166,7 +179,6 @@ def main():
                 print(f"  Frame {fi}/{num_frames}")
     print(f"Precomputed {num_frames} frames.")
 
-    # Precompute covariances and RGB
     print("Precomputing covariance matrices...")
     SH_C0 = 0.28209479177387814
     for fi in range(num_frames):
@@ -177,7 +189,6 @@ def main():
             print(f"  Covariances {fi}/{num_frames}")
     print("Covariances ready.")
 
-    # Create splats ONCE — update properties in-place
     init_data = frame_cache[0]
     splat_handle = server.scene.add_gaussian_splats(
         "/gaussians",
@@ -192,7 +203,6 @@ def main():
         nonlocal current_frame
         if frame_idx == current_frame and not force:
             return
-
         data = frame_cache[frame_idx]
         splat_handle.centers = data["positions"]
         splat_handle.covariances = data["covariances"]

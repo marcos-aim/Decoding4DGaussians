@@ -10,7 +10,9 @@ import numpy as np
 class CachedSceneDataset:
     """
     Loads precomputed features from cache and serves training batches.
-    All data stays on CPU; moved to GPU per-batch by the training loop.
+    Token and point-map tensors are moved to CUDA at init if available,
+    eliminating per-step CPU→GPU transfers. The training loop .cuda() calls
+    become no-ops on already-resident tensors.
     """
 
     def __init__(self, cache_dir: str, cameras: dict, input_camera: str = "cam01",
@@ -33,10 +35,6 @@ class CachedSceneDataset:
         # Align STV2 points from VGGT coordinate system to LLFF world space
         self._align_points_to_llff(cache_dir, cameras, input_camera)
 
-        # Scene normalization: center + scale (no rotation)
-        self.scene_center = None
-        self.scene_scale = None
-
         self.num_frames = self.tokens.shape[0]
         self.num_patches = self.tokens.shape[1]
         self.token_dim = self.tokens.shape[2]
@@ -48,98 +46,13 @@ class CachedSceneDataset:
         print(f"  num_patches (P): {self.num_patches}")
         print(f"  train cameras: {len(self.train_cam_names)}")
 
-    def apply_coordinate_normalization(self, cameras: dict):
-        """
-        Apply hybrid coordinate normalization: center + scale, no rotation.
-        Modifies self.points_map in-place and returns normalized cameras dict.
-
-        Normalization:
-            p_norm = (p - center) / scale
-        where:
-            center = median of all points (robust to outliers)
-            scale = max pairwise distance between camera centers
-        """
-        # Compute scene center from point cloud median
-        pts_all = self.points_map.reshape(-1, 3)
-        valid = pts_all.abs().sum(-1) > 1e-6
-        pts_valid = pts_all[valid]
-        self.scene_center = pts_valid.median(dim=0).values  # [3]
-
-        # Compute scale from max pairwise camera distance
-        cam_centers = []
-        for name, cam in cameras.items():
-            cam_centers.append(cam.camera_center.cpu())
-        cam_centers = torch.stack(cam_centers)  # [N_cams, 3]
-        dists = torch.cdist(cam_centers.unsqueeze(0), cam_centers.unsqueeze(0)).squeeze(0)
-        self.scene_scale = dists.max().item()
-
-        print(f"  [CoordNorm] Scene center: [{self.scene_center[0]:.3f}, {self.scene_center[1]:.3f}, {self.scene_center[2]:.3f}]")
-        print(f"  [CoordNorm] Scene scale (max cam dist): {self.scene_scale:.3f}")
-
-        # Normalize points_map
-        original_shape = self.points_map.shape
-        pts = self.points_map.reshape(-1, 3)
-        pts_norm = (pts - self.scene_center) / self.scene_scale
-        self.points_map = pts_norm.reshape(original_shape)
-
-        # Verify
-        pts_norm_valid = pts_norm[valid]
-        print(f"  [CoordNorm] Normalized points range: [{pts_norm_valid.min(dim=0).values.tolist()}] to [{pts_norm_valid.max(dim=0).values.tolist()}]")
-
-        # Normalize cameras
-        normalized_cameras = {}
-        for name, cam in cameras.items():
-            normalized_cameras[name] = self._normalize_camera(cam)
-
-        return normalized_cameras
-
-    def _normalize_camera(self, cam):
-        """
-        Create a new MiniCam with normalized world coordinates.
-
-        If original: p_view = W2V @ p_world
-        And normalization: p_world = scale * p_norm + center
-        Then: p_view = W2V @ (scale * p_norm + center)
-
-        New W2V_norm = W2V_orig @ denorm
-        where denorm = [[scale*I, center], [0, 1]]
-        """
-        from cameras import MiniCam
-
-        center = self.scene_center
-        scale = self.scene_scale
-
-        # Build denormalization matrix: maps normalized -> world
-        denorm = torch.eye(4)
-        denorm[:3, :3] *= scale
-        denorm[:3, 3] = center
-
-        # Original W2V (column-major, stored as row-major transposed)
-        w2v_orig = cam.world_view_transform.T.cpu()  # [4, 4] column-major
-        # New W2V: maps normalized coords -> view
-        w2v_norm = w2v_orig @ denorm
-
-        # Convert back to row-major transposed (MiniCam convention)
-        w2v_norm_T = w2v_norm.T
-
-        # Recompute projection with scaled near/far
-        from cameras import get_projection_matrix
-        proj = get_projection_matrix(
-            cam.znear, cam.zfar,  # keep original near/far since projection is in view space
-            cam.FoVx, cam.FoVy
-        )
-        proj_T = proj.T
-
-        return MiniCam.from_matrices(
-            width=cam.image_width,
-            height=cam.image_height,
-            fovx=cam.FoVx,
-            fovy=cam.FoVy,
-            znear=cam.znear,
-            zfar=cam.zfar,
-            world_view_transform=w2v_norm_T,
-            projection_matrix=proj_T,
-        )
+        # Move entire cache to CUDA — ~2.5GB, well within available VRAM.
+        # Eliminates per-step CPU→GPU transfers for tokens and points_map.
+        if torch.cuda.is_available():
+            self.tokens = self.tokens.cuda()
+            self.tokens_mean = self.tokens_mean.cuda()
+            self.points_map = self.points_map.cuda()
+            print(f"  Cache pinned to CUDA ({self.tokens.element_size() * self.tokens.nelement() / 1e9:.2f}GB tokens)")
 
     def _align_points_to_llff(self, cache_dir: str, cameras: dict, input_camera: str):
         """

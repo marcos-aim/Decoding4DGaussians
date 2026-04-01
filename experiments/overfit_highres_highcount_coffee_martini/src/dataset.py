@@ -10,7 +10,9 @@ import numpy as np
 class CachedSceneDataset:
     """
     Loads precomputed features from cache and serves training batches.
-    All data stays on CPU; moved to GPU per-batch by the training loop.
+    Token and point-map tensors are moved to CUDA at init if available,
+    eliminating per-step CPU→GPU transfers. The training loop .cuda() calls
+    become no-ops on already-resident tensors.
     """
 
     def __init__(self, cache_dir: str, cameras: dict, input_camera: str = "cam01",
@@ -43,6 +45,14 @@ class CachedSceneDataset:
         print(f"  points_map: {self.points_map.shape}")
         print(f"  num_patches (P): {self.num_patches}")
         print(f"  train cameras: {len(self.train_cam_names)}")
+
+        # Move entire cache to CUDA — ~2.5GB, well within available VRAM.
+        # Eliminates per-step CPU→GPU transfers for tokens and points_map.
+        if torch.cuda.is_available():
+            self.tokens = self.tokens.cuda()
+            self.tokens_mean = self.tokens_mean.cuda()
+            self.points_map = self.points_map.cuda()
+            print(f"  Cache pinned to CUDA ({self.tokens.element_size() * self.tokens.nelement() / 1e9:.2f}GB tokens)")
 
     def _align_points_to_llff(self, cache_dir: str, cameras: dict, input_camera: str):
         """

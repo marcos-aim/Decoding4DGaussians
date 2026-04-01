@@ -51,7 +51,8 @@ class DPTCanonicalGaussianHead(nn.Module):
                  init_xyz_per_gaussian: torch.Tensor = None,
                  spread: float = 0.05,
                  pyramid_dim: int = 256, fused_dim: int = 128,
-                 use_image_injection: bool = True):
+                 use_image_injection: bool = True,
+                 init_log_scale: float = math.log(0.5)):
         super().__init__()
         self.grid_h = grid_h
         self.grid_w = grid_w
@@ -104,6 +105,7 @@ class DPTCanonicalGaussianHead(nn.Module):
         else:
             self.xyz_anchor = None
 
+        self._init_log_scale = init_log_scale
         self._init_weights()
 
     def _init_weights(self):
@@ -115,9 +117,9 @@ class DPTCanonicalGaussianHead(nn.Module):
         # Opacity: sigmoid(0) = 0.5
         nn.init.zeros_(self.opacity_head.weight)
         nn.init.constant_(self.opacity_head.bias, inverse_sigmoid(0.5))
-        # Scale: small initial values (will be multiplied by depth-aware factor)
+        # Scale: log(0.5) → softplus(-0.693) ≈ 0.5 initial scale
         nn.init.zeros_(self.scale_head.weight)
-        nn.init.constant_(self.scale_head.bias, 0.0)  # sigmoid(0)=0.5, scaled by depth
+        nn.init.constant_(self.scale_head.bias, self._init_log_scale)
 
     def forward(self, tokens_mean: torch.Tensor, image: torch.Tensor = None):
         """
@@ -132,7 +134,14 @@ class DPTCanonicalGaussianHead(nn.Module):
         K = self.K
 
         # Reshape to 2D spatial grid: [P, C] -> [1, C, H, W]
-        x = tokens_mean.view(self.grid_h, self.grid_w, -1)
+        # Pad to fill the grid if P < grid_h * grid_w
+        grid_size = self.grid_h * self.grid_w
+        pad_len = grid_size - P
+        if pad_len > 0:
+            tokens_padded = torch.cat([tokens_mean, tokens_mean[-1:].expand(pad_len, -1)], dim=0)
+        else:
+            tokens_padded = tokens_mean
+        x = tokens_padded.view(self.grid_h, self.grid_w, -1)
         x = x.permute(2, 0, 1).unsqueeze(0)  # [1, dim_in, grid_h, grid_w]
 
         # Multi-scale pyramid
@@ -164,9 +173,9 @@ class DPTCanonicalGaussianHead(nn.Module):
 
         # Reshape all outputs from [1, C, H, W] -> [P*K, params]
         def _reshape(t, param_dim):
-            # [1, K*param_dim, H, W] -> [H*W, K*param_dim] -> [H*W*K, param_dim]
-            t = t.squeeze(0).permute(1, 2, 0)  # [H, W, K*param_dim]
-            t = t.reshape(P, K * param_dim)
+            # [1, K*param_dim, H, W] -> [grid_size, K*param_dim] -> slice P -> [P*K, param_dim]
+            t = t.squeeze(0).permute(1, 2, 0)  # [grid_h, grid_w, K*param_dim]
+            t = t.reshape(grid_size, K * param_dim)[:P]  # slice to P
             return t.reshape(P * K, param_dim)
 
         xyz_residual = _reshape(xyz_raw, 3)
@@ -177,8 +186,8 @@ class DPTCanonicalGaussianHead(nn.Module):
         logit_opacity = _reshape(opa_raw, 1)
         sh = _reshape(sh_raw, self.num_sh_coeffs * 3).view(P * K, self.num_sh_coeffs, 3)
 
-        # Hidden: [1, 1024, H, W] -> [P, 1024]
-        hidden_out = hidden.squeeze(0).permute(1, 2, 0).reshape(P, 1024)
+        # Hidden: [1, 1024, H, W] -> [P, 1024] (slice to P)
+        hidden_out = hidden.squeeze(0).permute(1, 2, 0).reshape(grid_size, 1024)[:P]
 
         return {
             "xyz": xyz,

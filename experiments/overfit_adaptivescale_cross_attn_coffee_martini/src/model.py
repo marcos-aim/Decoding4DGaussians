@@ -35,7 +35,8 @@ class CanonicalGaussianHead(nn.Module):
                  init_xyz: torch.Tensor = None, num_gaussians_per_patch: int = 1,
                  init_xyz_per_gaussian: torch.Tensor = None,
                  init_log_scale: float = math.log(0.5),
-                 spread: float = 0.05):
+                 spread: float = 0.05,
+                 scale_anchor: torch.Tensor = None):
         super().__init__()
         self.sh_degree = sh_degree
         self.num_sh_coeffs = (sh_degree + 1) ** 2
@@ -69,6 +70,11 @@ class CanonicalGaussianHead(nn.Module):
         else:
             self.xyz_anchor = None
 
+        if scale_anchor is not None:
+            self.register_buffer("scale_anchor", scale_anchor.float())
+        else:
+            self.scale_anchor = None
+
         self._init_log_scale = init_log_scale
         self._init_weights()
 
@@ -80,7 +86,10 @@ class CanonicalGaussianHead(nn.Module):
         nn.init.zeros_(self.opacity_head.weight)
         nn.init.constant_(self.opacity_head.bias, inverse_sigmoid(0.5))
         nn.init.zeros_(self.scale_head.weight)
-        nn.init.constant_(self.scale_head.bias, self._init_log_scale)
+        if self.scale_anchor is not None:
+            nn.init.zeros_(self.scale_head.bias)  # anchor provides the init
+        else:
+            nn.init.constant_(self.scale_head.bias, self._init_log_scale)
 
     def forward(self, tokens_mean: torch.Tensor):
         P = tokens_mean.shape[0]
@@ -91,6 +100,8 @@ class CanonicalGaussianHead(nn.Module):
         xyz = xyz_residual + self.xyz_anchor if self.xyz_anchor is not None else xyz_residual
 
         log_scale = self.scale_head(x).view(P * K, 3)
+        if self.scale_anchor is not None:
+            log_scale = log_scale + self.scale_anchor
         rot = F.normalize(self.rot_head(x).view(P * K, 4), dim=-1)
         logit_opacity = self.opacity_head(x).view(P * K, 1)
         sh = self.sh_head(x).view(P * K, self.num_sh_coeffs, 3)

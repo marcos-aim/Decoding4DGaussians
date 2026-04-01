@@ -1,6 +1,6 @@
 """Unified training: Stage 1 canonical + Stage 2/3 cross-attention deformation.
 
-H1: Full DPT canonical head with 4-level synthetic pyramid + top-down fusion.
+High-resolution version (1024x768). All 3 stages from scratch.
 """
 
 import math
@@ -11,6 +11,7 @@ import time
 import yaml
 import torch
 import torch.optim as optim
+torch.set_num_threads(4)
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
@@ -18,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from cameras import build_cameras_from_llff
 from dataset import CachedSceneDataset
-from model import DPTCanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
+from model import CanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
 from renderer import render_gaussians
 from losses import photometric_loss, compute_psnr, scale_regularization, opacity_regularization
 
@@ -49,9 +50,9 @@ def tv_loss(deltas_t, deltas_prev):
     return (deltas_t - deltas_prev).pow(2).mean()
 
 
-def build_heads(cfg, dataset):
+def build_heads(cfg, dataset, norm_scale: float = 1.0):
     P = dataset.num_patches
-    K = cfg["model"].get("num_gaussians_per_patch", 128)
+    K = cfg["model"].get("num_gaussians_per_patch", 1)
     pts_mean = dataset.points_map.mean(dim=0)
     H, W = pts_mean.shape[0], pts_mean.shape[1]
     pts_flat = pts_mean.reshape(-1, 3)
@@ -89,54 +90,48 @@ def build_heads(cfg, dataset):
 
     print(f"  Patch grid: {grid_h}x{grid_w}, P={P}, K={K}, total Gaussians={P*K}")
 
-    # Resolution-aware hyperparameters
+    # Resolution-aware hyperparameters (calibrated at REF_W=512)
+    # norm_scale: coordinate normalization scale factor (1.0 if no normalization)
     REF_W = 512
-    res_scale = REF_W / W
-    spread = 0.05 * res_scale
-    ssim_win_size = max(11, round(11 / res_scale)) | 1
+    res_scale = REF_W / W  # 1.0 at 512, 0.5 at 1024
+    init_log_scale = math.log(0.5 * res_scale * norm_scale)
+    spread = 0.05 * res_scale * norm_scale
+    ssim_win_size = max(11, round(11 / res_scale)) | 1  # must be odd
+    print(f"  Resolution scaling: W={W}, res_scale={res_scale:.2f}, norm_scale={norm_scale:.4f}")
+    print(f"  Scale init: log({0.5 * res_scale * norm_scale:.4f}) = {init_log_scale:.3f}")
+    print(f"  Spread: {spread:.5f}, SSIM win: {ssim_win_size}")
 
-    print(f"  Resolution scaling: W={W}, res_scale={res_scale:.2f}")
-    print(f"  Spread: {spread:.4f}, SSIM win: {ssim_win_size}")
-
-    # DPT canonical head config
-    can_cfg = cfg["model"]["canonical"]
-    pyramid_dim = can_cfg.get("pyramid_dim", 256)
-    fused_dim = can_cfg.get("fused_dim", 128)
-    use_image_injection = can_cfg.get("use_image_injection", False)
-
-    init_log_scale = math.log(0.5 * res_scale)
-
-    canonical_head = DPTCanonicalGaussianHead(
-        dim_in=can_cfg["dim_in"],
-        grid_h=grid_h,
-        grid_w=grid_w,
-        sh_degree=can_cfg["sh_degree"],
-        num_gaussians_per_patch=K,
+    canonical_head = CanonicalGaussianHead(
+        dim_in=cfg["model"]["canonical"]["dim_in"],
+        dim_hidden=cfg["model"]["canonical"]["dim_hidden"],
+        sh_degree=cfg["model"]["canonical"]["sh_degree"],
         init_xyz=init_xyz,
+        num_gaussians_per_patch=K,
         init_xyz_per_gaussian=init_xyz_per_gaussian,
-        spread=spread,
-        pyramid_dim=pyramid_dim,
-        fused_dim=fused_dim,
-        use_image_injection=use_image_injection,
         init_log_scale=init_log_scale,
+        spread=spread,
     ).cuda()
 
     defo_cfg = cfg["model"]["deformation"]
+    max_displacement = defo_cfg.get("max_displacement", 2.0) * norm_scale
     deformation_head = CrossAttentionDeformationHead(
         dim_canonical=defo_cfg["dim_canonical"],
         dim_tokens=defo_cfg["dim_tokens"],
         dim_hidden=defo_cfg["dim_hidden"],
         n_heads=defo_cfg["n_heads"],
         n_layers=defo_cfg["n_layers"],
-        sh_degree=can_cfg["sh_degree"],
+        sh_degree=cfg["model"]["canonical"]["sh_degree"],
         num_gaussians_per_patch=K,
-        max_displacement=defo_cfg.get("max_displacement", 2.0),
+        max_displacement=max_displacement,
     ).cuda()
 
-    print(f"  DPTCanonicalHead: {sum(p.numel() for p in canonical_head.parameters())/1e6:.1f}M params")
-    print(f"  CrossAttentionDeformHead: {sum(p.numel() for p in deformation_head.parameters())/1e6:.1f}M params")
+    max_scale = 5.0 * norm_scale  # clamp Gaussians to proportional size in normalized space
 
-    return canonical_head, deformation_head, res_scale, ssim_win_size
+    print(f"  CanonicalHead: {sum(p.numel() for p in canonical_head.parameters())/1e6:.1f}M params")
+    print(f"  CrossAttentionDeformHead: {sum(p.numel() for p in deformation_head.parameters())/1e6:.1f}M params")
+    print(f"  Max Gaussian scale: {max_scale:.4f} (5.0 * norm_scale)")
+
+    return canonical_head, deformation_head, res_scale, ssim_win_size, max_scale
 
 
 def train(config_path: str, resume_stage: int = 1):
@@ -167,7 +162,15 @@ def train(config_path: str, resume_stage: int = 1):
         eval_camera=cfg["data"]["eval_camera"],
     )
 
-    canonical_head, deformation_head, res_scale, ssim_win_size = build_heads(cfg, dataset)
+    # Apply coordinate normalization if configured
+    coord_norm_cfg = cfg.get("coordinate_normalization", {})
+    norm_scale = 1.0
+    if coord_norm_cfg.get("enabled", False):
+        print("\n  Applying coordinate normalization...")
+        cameras, norm_scale = dataset.apply_coordinate_normalization(cameras)
+        print(f"  Coordinate normalization applied (mode: {coord_norm_cfg.get('mode', 'hybrid')}, scale={norm_scale:.4f})")
+
+    canonical_head, deformation_head, res_scale, ssim_win_size, max_scale = build_heads(cfg, dataset, norm_scale=norm_scale)
 
     bg_color = torch.zeros(3, device="cuda")
     sh_degree = cfg["model"]["canonical"]["sh_degree"]
@@ -180,10 +183,10 @@ def train(config_path: str, resume_stage: int = 1):
     writer = SummaryWriter(log_dir)
     start_time = time.time()
 
-    # ===== STAGE 1: DPT Canonical Head =====
+    # ===== STAGE 1: Canonical Head =====
     if resume_stage <= 1:
         print("\n" + "=" * 60)
-        print("STAGE 1: Training DPT Canonical Head (static scene)")
+        print("STAGE 1: Training Canonical Head (static scene)")
         print("=" * 60)
 
         deformation_head.eval()
@@ -198,7 +201,7 @@ def train(config_path: str, resume_stage: int = 1):
         scheduler_s1 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s1, T_max=s1_cfg["steps"])
         torch.cuda.reset_peak_memory_stats()
 
-        pbar = tqdm(range(s1_cfg["steps"]), desc="Stage 1 (DPT Canonical)")
+        pbar = tqdm(range(s1_cfg["steps"]), desc="Stage 1 (Canonical)")
         for step in pbar:
             optimizer_s1.zero_grad()
 
@@ -206,7 +209,7 @@ def train(config_path: str, resume_stage: int = 1):
             tokens_mean = batch["tokens_mean"].cuda()
             canonical = canonical_head(tokens_mean)
             means3D, scales, rotations, opacity, shs = compose_gaussians(
-                canonical, scale_factor=scale_anneal_target
+                canonical, scale_factor=scale_anneal_target, max_scale=max_scale
             )
 
             total_loss = torch.tensor(0.0, device="cuda")
@@ -230,9 +233,15 @@ def train(config_path: str, resume_stage: int = 1):
             avg_psnr = total_psnr / max(num_renders, 1)
 
             if s1_weights.get("scale_reg", 0) > 0:
-                total_loss = total_loss + s1_weights["scale_reg"] * res_scale * scale_regularization(scales)
+                total_loss = total_loss + s1_weights["scale_reg"] * res_scale / norm_scale * scale_regularization(scales)
             if s1_weights.get("opacity_reg", 0) > 0:
                 total_loss = total_loss + s1_weights["opacity_reg"] * opacity_regularization(opacity)
+            if s1_weights.get("geo", 0) > 0 and canonical_head.xyz_anchor is not None:
+                # Anchor reg: penalise Gaussians flying away from init positions.
+                # Scale by 1/norm_scale^2 so the effective penalty matches LLFF-space magnitude.
+                xyz_disp = canonical["xyz"] - canonical_head.xyz_anchor
+                xyz_anchor_reg = (xyz_disp ** 2).mean()
+                total_loss = total_loss + s1_weights["geo"] / (norm_scale ** 2) * xyz_anchor_reg
 
             if torch.isnan(total_loss):
                 print(f"\n[ABORT] NaN at step {step}!")
@@ -261,7 +270,7 @@ def train(config_path: str, resume_stage: int = 1):
                     eval_cam = cameras[eval_cam_name]
                     tokens_mean_eval = dataset.get_tokens_mean().cuda()
                     canonical_eval = canonical_head(tokens_mean_eval)
-                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, scale_factor=scale_anneal_target)
+                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, scale_factor=scale_anneal_target, max_scale=max_scale)
                     gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
                     rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
                     novel_psnr = compute_psnr(rendered_novel, gt_novel)
@@ -314,7 +323,7 @@ def train(config_path: str, resume_stage: int = 1):
                 tokens_t = batch["tokens_frames"][i].cuda()
                 deltas = deformation_head(canonical["hidden"], tokens_t)
                 means3D, scales, rotations, opacity, shs = compose_gaussians(
-                    canonical, deltas, scale_factor=scale_anneal_target
+                    canonical, deltas, scale_factor=scale_anneal_target, max_scale=max_scale
                 )
                 for cam_name in batch["cam_names"]:
                     cam = cameras[cam_name]
@@ -338,7 +347,7 @@ def train(config_path: str, resume_stage: int = 1):
             avg_psnr = total_psnr / max(num_renders, 1)
 
             if s2_weights.get("scale_reg", 0) > 0:
-                total_loss = total_loss + s2_weights["scale_reg"] * res_scale * scale_regularization(scales)
+                total_loss = total_loss + s2_weights["scale_reg"] * res_scale / norm_scale * scale_regularization(scales)
             if s2_weights.get("opacity_reg", 0) > 0:
                 total_loss = total_loss + s2_weights["opacity_reg"] * opacity_regularization(opacity)
 
@@ -371,7 +380,7 @@ def train(config_path: str, resume_stage: int = 1):
                     canonical_eval = canonical_head(tokens_mean_eval)
                     tokens_t_eval = dataset.get_tokens_frame(0).cuda()
                     deltas_eval = deformation_head(canonical_eval["hidden"], tokens_t_eval)
-                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval, scale_factor=scale_anneal_target)
+                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval, scale_factor=scale_anneal_target, max_scale=max_scale)
                     gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
                     rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
                     novel_psnr = compute_psnr(rendered_novel, gt_novel)
@@ -425,7 +434,7 @@ def train(config_path: str, resume_stage: int = 1):
                 tokens_t = batch["tokens_frames"][i].cuda()
                 deltas = deformation_head(canonical["hidden"], tokens_t)
                 means3D, scales, rotations, opacity, shs = compose_gaussians(
-                    canonical, deltas, scale_factor=scale_anneal_target
+                    canonical, deltas, scale_factor=scale_anneal_target, max_scale=max_scale
                 )
                 for cam_name in batch["cam_names"]:
                     cam = cameras[cam_name]
@@ -449,7 +458,7 @@ def train(config_path: str, resume_stage: int = 1):
             avg_psnr = total_psnr / max(num_renders, 1)
 
             if s3_weights.get("scale_reg", 0) > 0:
-                total_loss = total_loss + s3_weights["scale_reg"] * res_scale * scale_regularization(scales)
+                total_loss = total_loss + s3_weights["scale_reg"] * res_scale / norm_scale * scale_regularization(scales)
             if s3_weights.get("opacity_reg", 0) > 0:
                 total_loss = total_loss + s3_weights["opacity_reg"] * opacity_regularization(opacity)
 
@@ -483,7 +492,7 @@ def train(config_path: str, resume_stage: int = 1):
                     canonical_eval = canonical_head(tokens_mean_eval)
                     tokens_t_eval = dataset.get_tokens_frame(0).cuda()
                     deltas_eval = deformation_head(canonical_eval["hidden"], tokens_t_eval)
-                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval, scale_factor=scale_anneal_target)
+                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval, scale_factor=scale_anneal_target, max_scale=max_scale)
                     gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
                     rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
                     novel_psnr = compute_psnr(rendered_novel, gt_novel)
@@ -504,7 +513,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str,
-                        default="D:/DecodeGaussians/experiments/overfit_dpt_full_cross_attn_coffee_martini/config.yaml")
+                        default="D:/DecodeGaussians/experiments/overfit_highres_cross_attn_coffee_martini/config.yaml")
     parser.add_argument("--resume-stage", type=int, default=1,
                         help="1=full run, 2=skip stage1, 3=joint only")
     args = parser.parse_args()

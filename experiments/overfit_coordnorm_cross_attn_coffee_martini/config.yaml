@@ -1,5 +1,5 @@
 experiment:
-  name: overfit_coordnorm_hybrid_cross_attn_coffee_martini
+  name: overfit_coordnorm_cross_attn_coffee_martini
   scene: coffee_martini
   mode: cross_attention_deformation
   # CHANGE: Scene-normalized coordinates (center + scale, no PCA rotation)
@@ -8,9 +8,9 @@ paths:
   neu3d_scene: D:\DecodeGaussians\datasets\neu3d\coffee_martini
   spatracker_root: D:\DecodeGaussians\SpaTrackerV2
   cache_dir: D:\DecodeGaussians\experiments\overfit_coffee_martini\cache
-  checkpoint_dir: D:\DecodeGaussians\experiments\overfit_coordnorm_hybrid_cross_attn_coffee_martini\checkpoints
-  render_dir: D:\DecodeGaussians\experiments\overfit_coordnorm_hybrid_cross_attn_coffee_martini\renders
-  log_dir: D:\DecodeGaussians\experiments\overfit_coordnorm_hybrid_cross_attn_coffee_martini\logs
+  checkpoint_dir: D:\DecodeGaussians\experiments\overfit_coordnorm_cross_attn_coffee_martini\checkpoints
+  render_dir: D:\DecodeGaussians\experiments\overfit_coordnorm_cross_attn_coffee_martini\renders
+  log_dir: D:\DecodeGaussians\experiments\overfit_coordnorm_cross_attn_coffee_martini\logs
   # NO canonical checkpoint — must retrain stage 1 in normalized coords
   # canonical_checkpoint: (none — train from scratch)
 

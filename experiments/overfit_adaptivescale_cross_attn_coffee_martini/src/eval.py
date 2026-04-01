@@ -99,6 +99,15 @@ def evaluate(config_path: str, checkpoint_path: str = None):
     indices = torch.linspace(0, pts_flat.shape[0] - 1, P).long()
     init_xyz = pts_flat[indices]
 
+    # Compute per-patch NN scale anchor (same as train.py)
+    pts_per_patch = init_xyz.cpu()  # [P, 3]
+    dists = torch.cdist(pts_per_patch, pts_per_patch)  # [P, P]
+    dists.fill_diagonal_(float('inf'))
+    nn_dist = dists.min(dim=1).values.clamp(min=1e-6)  # [P]
+    log_nn = torch.log(nn_dist)                         # [P]
+    log_nn_pk = log_nn.unsqueeze(1).expand(-1, K).reshape(P * K)
+    scale_anchor = log_nn_pk.unsqueeze(1).expand(-1, 3).contiguous()  # [P*K, 3]
+
     canonical_head = CanonicalGaussianHead(
         dim_in=cfg["model"]["canonical"]["dim_in"],
         dim_hidden=cfg["model"]["canonical"]["dim_hidden"],
@@ -106,6 +115,7 @@ def evaluate(config_path: str, checkpoint_path: str = None):
         init_xyz=init_xyz,
         num_gaussians_per_patch=K,
         init_xyz_per_gaussian=init_xyz_per_gaussian,
+        scale_anchor=scale_anchor,
     ).cuda()
 
     defo_cfg = cfg["model"]["deformation"]
@@ -207,7 +217,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str,
-                        default="D:/DecodeGaussians/experiments/overfit_highres_cross_attn_coffee_martini/config.yaml")
+                        default="D:/DecodeGaussians/experiments/overfit_cross_attn_coffee_martini/config.yaml")
     parser.add_argument("--checkpoint", type=str, default=None)
     args = parser.parse_args()
     evaluate(args.config, args.checkpoint)

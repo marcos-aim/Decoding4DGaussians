@@ -143,11 +143,9 @@ def main():
     with torch.no_grad():
         tokens_mean = dataset.get_tokens_mean().cuda()
         canonical = canonical_head(tokens_mean)
-        # Keep hidden on CPU to reduce VRAM pressure during loop
-        canonical_hidden_cpu = canonical["hidden"].cpu()
         for fi in range(num_frames):
             tokens_t = dataset.get_tokens_frame(fi).cuda()
-            canonical["hidden"] = canonical_hidden_cpu.cuda()
+            # Cross-attention: pass canonical hidden + frame tokens
             deltas = deformation_head(canonical["hidden"], tokens_t)
             means3D, scales, rotations, opacity, shs = compose_gaussians(
                 canonical, deltas, scale_factor=scale_anneal_target
@@ -159,9 +157,6 @@ def main():
                 "opacities": opacity.squeeze(-1).cpu().numpy().astype(np.float32),
                 "colors_sh": shs[:, 0, :].cpu().numpy().astype(np.float32),
             }
-            del tokens_t, deltas, means3D, scales, rotations, opacity, shs
-            canonical["hidden"] = canonical_hidden_cpu
-            torch.cuda.empty_cache()
             if fi % 50 == 0:
                 print(f"  Frame {fi}/{num_frames}")
     print(f"Precomputed {num_frames} frames.")

@@ -1,5 +1,6 @@
 """Evaluate cross-attention model: render novel views, compute metrics, export PLY."""
 
+import math
 import os
 import sys
 import glob
@@ -14,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from cameras import build_cameras_from_llff
 from dataset import CachedSceneDataset
-from model import CanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
+from model import DPTCanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
 from renderer import render_gaussians
 from losses import compute_psnr
 from pytorch_msssim import ssim as compute_ssim
@@ -99,13 +100,31 @@ def evaluate(config_path: str, checkpoint_path: str = None):
     indices = torch.linspace(0, pts_flat.shape[0] - 1, P).long()
     init_xyz = pts_flat[indices]
 
-    canonical_head = CanonicalGaussianHead(
-        dim_in=cfg["model"]["canonical"]["dim_in"],
-        dim_hidden=cfg["model"]["canonical"]["dim_hidden"],
-        sh_degree=cfg["model"]["canonical"]["sh_degree"],
-        init_xyz=init_xyz,
+    REF_W = 512
+    res_scale = REF_W / W
+    init_log_scale = math.log(0.5 * res_scale)
+    spread = 0.05 * res_scale
+
+    can_cfg = cfg["model"]["canonical"]
+    pyramid_dim = can_cfg.get("pyramid_dim", 256)
+    fused_dim = can_cfg.get("fused_dim", 128)
+    use_image_injection = can_cfg.get("use_image_injection", False)
+    cfg_grid_h = can_cfg.get("grid_h", grid_h)
+    cfg_grid_w = can_cfg.get("grid_w", grid_w)
+
+    canonical_head = DPTCanonicalGaussianHead(
+        dim_in=can_cfg["dim_in"],
+        grid_h=cfg_grid_h,
+        grid_w=cfg_grid_w,
+        sh_degree=can_cfg["sh_degree"],
         num_gaussians_per_patch=K,
+        init_xyz=init_xyz,
         init_xyz_per_gaussian=init_xyz_per_gaussian,
+        spread=spread,
+        pyramid_dim=pyramid_dim,
+        fused_dim=fused_dim,
+        use_image_injection=use_image_injection,
+        init_log_scale=init_log_scale,
     ).cuda()
 
     defo_cfg = cfg["model"]["deformation"]

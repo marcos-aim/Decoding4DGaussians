@@ -1,6 +1,5 @@
 """Evaluate cross-attention model: render novel views, compute metrics, export PLY."""
 
-import math
 import os
 import sys
 import glob
@@ -15,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from cameras import build_cameras_from_llff
 from dataset import CachedSceneDataset
-from model import HybridDPTCanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
+from model import CanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
 from renderer import render_gaussians
 from losses import compute_psnr
 from pytorch_msssim import ssim as compute_ssim
@@ -61,6 +60,7 @@ def evaluate(config_path: str, checkpoint_path: str = None):
     )
 
     dataset = CachedSceneDataset(cache_dir, cameras)
+    cameras, norm_scale = dataset.apply_coordinate_normalization(cameras)
 
     P = dataset.num_patches
     K = cfg["model"].get("num_gaussians_per_patch", 1)
@@ -100,28 +100,13 @@ def evaluate(config_path: str, checkpoint_path: str = None):
     indices = torch.linspace(0, pts_flat.shape[0] - 1, P).long()
     init_xyz = pts_flat[indices]
 
-    REF_W = 512
-    res_scale = REF_W / W
-    init_log_scale = math.log(0.5 * res_scale)
-    spread = 0.05 * res_scale
-
-    can_cfg = cfg["model"]["canonical"]
-    dpt_dim = can_cfg.get("dpt_dim", 512)
-    cfg_grid_h = can_cfg.get("grid_h", grid_h)
-    cfg_grid_w = can_cfg.get("grid_w", grid_w)
-
-    canonical_head = HybridDPTCanonicalGaussianHead(
-        dim_in=can_cfg["dim_in"],
-        dim_hidden=can_cfg["dim_hidden"],
-        grid_h=cfg_grid_h,
-        grid_w=cfg_grid_w,
-        sh_degree=can_cfg["sh_degree"],
-        num_gaussians_per_patch=K,
+    canonical_head = CanonicalGaussianHead(
+        dim_in=cfg["model"]["canonical"]["dim_in"],
+        dim_hidden=cfg["model"]["canonical"]["dim_hidden"],
+        sh_degree=cfg["model"]["canonical"]["sh_degree"],
         init_xyz=init_xyz,
+        num_gaussians_per_patch=K,
         init_xyz_per_gaussian=init_xyz_per_gaussian,
-        init_log_scale=init_log_scale,
-        spread=spread,
-        dpt_dim=dpt_dim,
     ).cuda()
 
     defo_cfg = cfg["model"]["deformation"]
@@ -133,7 +118,7 @@ def evaluate(config_path: str, checkpoint_path: str = None):
         n_layers=defo_cfg["n_layers"],
         sh_degree=cfg["model"]["canonical"]["sh_degree"],
         num_gaussians_per_patch=K,
-        max_displacement=defo_cfg.get("max_displacement", 2.0),
+        max_displacement=defo_cfg.get("max_displacement", 2.0) * norm_scale,
     ).cuda()
 
     if checkpoint_path is None:
@@ -167,7 +152,7 @@ def evaluate(config_path: str, checkpoint_path: str = None):
             # Cross-attention: pass canonical hidden features + frame tokens
             deltas = deformation_head(canonical["hidden"], tokens_t)
             means3D, scales, rotations, opacity, shs = compose_gaussians(
-                canonical, deltas, scale_factor=scale_anneal_target
+                canonical, deltas, scale_factor=scale_anneal_target, max_scale=5.0 * norm_scale
             )
 
             rendered, _, _, _ = render_gaussians(
@@ -196,7 +181,7 @@ def evaluate(config_path: str, checkpoint_path: str = None):
     with torch.no_grad():
         tokens_mean = dataset.get_tokens_mean().cuda()
         canonical = canonical_head(tokens_mean)
-        means3D, scales, _, opacity, _ = compose_gaussians(canonical, scale_factor=scale_anneal_target)
+        means3D, scales, _, opacity, _ = compose_gaussians(canonical, scale_factor=scale_anneal_target, max_scale=5.0 * norm_scale)
         pts = means3D.cpu().numpy()
         op = opacity.squeeze(-1).cpu().numpy()
         colors = (np.stack([op, op, op], axis=-1) * 255).astype(np.uint8)

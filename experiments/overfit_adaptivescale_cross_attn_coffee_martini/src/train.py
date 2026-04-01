@@ -11,6 +11,7 @@ import time
 import yaml
 import torch
 import torch.optim as optim
+torch.set_num_threads(4)
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
@@ -89,14 +90,23 @@ def build_heads(cfg, dataset):
 
     print(f"  Patch grid: {grid_h}x{grid_w}, P={P}, K={K}, total Gaussians={P*K}")
 
-    # Resolution-aware hyperparameters (calibrated at REF_W=512)
     REF_W = 512
-    res_scale = REF_W / W  # 1.0 at 512, 0.5 at 1024
-    init_log_scale = math.log(0.5 * res_scale)
+    res_scale = REF_W / W
     spread = 0.05 * res_scale
-    ssim_win_size = max(11, round(11 / res_scale)) | 1  # must be odd
-    print(f"  Resolution scaling: W={W}, res_scale={res_scale:.2f}")
-    print(f"  Scale init: log({0.5 * res_scale:.3f}) = {init_log_scale:.3f}")
+    ssim_win_size = max(11, round(11 / res_scale)) | 1
+
+    # Per-patch nearest-neighbor scale init (3DGS approach)
+    # Fully feedforward: uses only cached points_map
+    pts_per_patch = init_xyz.cpu()  # [P, 3]
+    dists = torch.cdist(pts_per_patch, pts_per_patch)  # [P, P]
+    dists.fill_diagonal_(float('inf'))
+    nn_dist = dists.min(dim=1).values.clamp(min=1e-6)  # [P]
+    log_nn = torch.log(nn_dist)                         # [P]
+    log_nn_pk = log_nn.unsqueeze(1).expand(-1, K).reshape(P * K)
+    scale_anchor = log_nn_pk.unsqueeze(1).expand(-1, 3).contiguous()  # [P*K, 3]
+
+    print(f"  Res scale: W={W}, res_scale={res_scale:.2f}")
+    print(f"  Scale anchor: min={log_nn.min():.3f}, mean={log_nn.mean():.3f}, max={log_nn.max():.3f}")
     print(f"  Spread: {spread:.4f}, SSIM win: {ssim_win_size}")
 
     canonical_head = CanonicalGaussianHead(
@@ -106,11 +116,12 @@ def build_heads(cfg, dataset):
         init_xyz=init_xyz,
         num_gaussians_per_patch=K,
         init_xyz_per_gaussian=init_xyz_per_gaussian,
-        init_log_scale=init_log_scale,
         spread=spread,
+        scale_anchor=scale_anchor,
     ).cuda()
 
     defo_cfg = cfg["model"]["deformation"]
+    max_displacement = defo_cfg.get("max_displacement", 2.0)
     deformation_head = CrossAttentionDeformationHead(
         dim_canonical=defo_cfg["dim_canonical"],
         dim_tokens=defo_cfg["dim_tokens"],
@@ -119,7 +130,7 @@ def build_heads(cfg, dataset):
         n_layers=defo_cfg["n_layers"],
         sh_degree=cfg["model"]["canonical"]["sh_degree"],
         num_gaussians_per_patch=K,
-        max_displacement=defo_cfg.get("max_displacement", 2.0),
+        max_displacement=max_displacement,
     ).cuda()
 
     print(f"  CanonicalHead: {sum(p.numel() for p in canonical_head.parameters())/1e6:.1f}M params")
@@ -156,12 +167,6 @@ def train(config_path: str, resume_stage: int = 1):
         eval_camera=cfg["data"]["eval_camera"],
     )
 
-    # Apply coordinate normalization if configured
-    coord_norm_cfg = cfg.get("coordinate_normalization", {})
-    if coord_norm_cfg.get("enabled", False):
-        print("\n  Applying coordinate normalization...")
-        cameras = dataset.apply_coordinate_normalization(cameras)
-        print(f"  Coordinate normalization applied (mode: {coord_norm_cfg.get('mode', 'hybrid')})")
 
     canonical_head, deformation_head, res_scale, ssim_win_size = build_heads(cfg, dataset)
 

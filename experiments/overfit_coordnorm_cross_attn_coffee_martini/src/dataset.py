@@ -6,6 +6,8 @@ import cv2
 import torch
 import numpy as np
 
+from cameras import MiniCam
+
 
 class CachedSceneDataset:
     """
@@ -143,6 +145,54 @@ class CachedSceneDataset:
 
         cam_center = cam01.camera_center.cpu()
         print(f"  [Align] LLFF cam01 center: [{cam_center[0]:.2f}, {cam_center[1]:.2f}, {cam_center[2]:.2f}]")
+
+    def apply_coordinate_normalization(self, cameras: dict):
+        """
+        Normalize point cloud to unit scale centered at median.
+        Transforms both points_map and camera extrinsics consistently.
+
+        mode: hybrid — center at median of valid points, scale = 1/max_cam_dist
+        """
+        pts = self.points_map.reshape(-1, 3).cpu()
+        valid = pts.abs().sum(-1) > 1e-6
+        pts_valid = pts[valid]
+        center = pts_valid.median(dim=0).values  # [3]
+
+        cam_centers = torch.stack([c.camera_center.cpu() for c in cameras.values()])
+        dists = torch.cdist(cam_centers, cam_centers)
+        max_cam_dist = dists.max().item()
+        scale = 1.0 / max(max_cam_dist, 1e-6)
+
+        print(f"  CoordNorm center: [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]")
+        print(f"  CoordNorm max_cam_dist: {max_cam_dist:.3f}, scale: {scale:.4f}")
+
+        # Normalize points_map (already on CUDA after init)
+        center_cuda = center.to(self.points_map.device)
+        self.points_map = (self.points_map - center_cuda) * scale
+
+        # Transform cameras: W2V_new = W2V @ T_norm_inv
+        # T_norm_inv maps normalized -> original: p_orig = p_norm/scale + center
+        T_norm_inv = torch.eye(4)
+        T_norm_inv[:3, :3] = torch.eye(3) * (1.0 / scale)
+        T_norm_inv[:3, 3] = center.float()
+
+        new_cameras = {}
+        for name, cam in cameras.items():
+            w2v = cam.world_view_transform.cpu().T  # column-major W2V
+            w2v_new = w2v @ T_norm_inv
+            wvt_new = w2v_new.T  # back to row-major
+            new_cameras[name] = MiniCam.from_matrices(
+                width=cam.image_width,
+                height=cam.image_height,
+                fovx=cam.FoVx,
+                fovy=cam.FoVy,
+                znear=cam.znear,
+                zfar=cam.zfar,
+                world_view_transform=wvt_new,
+                projection_matrix=cam.projection_matrix.cpu(),
+            )
+
+        return new_cameras, scale
 
     def get_tokens_mean(self) -> torch.Tensor:
         return self.tokens_mean
