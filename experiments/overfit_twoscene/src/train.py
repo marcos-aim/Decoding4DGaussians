@@ -283,122 +283,122 @@ def train(config_path: str, resume_stage: int = 1, restart_latest: bool = False)
         print("STAGE 1: Training Canonical Head (Multi-Scene)")
         print("=" * 60)
 
-    canonical_head.train()
-    deformation_head.eval()
+        canonical_head.train()
+        deformation_head.eval()
 
-    s1_steps = cfg["training"]["stage1_steps"]
-    s1_lr = cfg["training"]["stage1_lr"]
-    s1_batch_frames = cfg["training"]["stage1_batch_frames"]
-    s1_supervision_cams = cfg["training"]["stage1_supervision_cams"]
+        s1_steps = cfg["training"]["stage1_steps"]
+        s1_lr = cfg["training"]["stage1_lr"]
+        s1_batch_frames = cfg["training"]["stage1_batch_frames"]
+        s1_supervision_cams = cfg["training"]["stage1_supervision_cams"]
 
-    optimizer_s1 = optim.AdamW(canonical_head.parameters(), lr=s1_lr)
-    scheduler_s1 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s1, T_max=s1_steps)
+        optimizer_s1 = optim.AdamW(canonical_head.parameters(), lr=s1_lr)
+        scheduler_s1 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s1, T_max=s1_steps)
 
-    # If restarting within stage 1, load optimizer state and advance scheduler
-    should_continue_stage1 = (restart_from_stage == 1 and restart_from_step is not None)
-    start_step_s1 = 0
-    if should_continue_stage1:
-        print(f"  Continuing Stage 1 from step {restart_from_step}")
-        start_step_s1 = restart_from_step
-        if "optimizer" in ckpt:
-            optimizer_s1.load_state_dict(ckpt["optimizer"])
-        # Advance scheduler to correct position
-        for _ in range(restart_from_step):
+        # If restarting within stage 1, load optimizer state and advance scheduler
+        should_continue_stage1 = (restart_from_stage == 1 and restart_from_step is not None)
+        start_step_s1 = 0
+        if should_continue_stage1:
+            print(f"  Continuing Stage 1 from step {restart_from_step}")
+            start_step_s1 = restart_from_step
+            if "optimizer" in ckpt:
+                optimizer_s1.load_state_dict(ckpt["optimizer"])
+            # Advance scheduler to correct position
+            for _ in range(restart_from_step):
+                scheduler_s1.step()
+
+        torch.cuda.reset_peak_memory_stats()
+
+        pbar = tqdm(range(start_step_s1, s1_steps), desc="Stage 1 (Canonical)")
+        for step in pbar:
+            optimizer_s1.zero_grad()
+
+            # Sample batches from all scenes
+            scene_batches = multi_dataset.sample_multi_scene_batch(s1_batch_frames, s1_supervision_cams)
+
+            total_psnr = 0.0
+            total_renders = 0
+            total_loss = torch.tensor(0.0, device="cuda")  # Accumulate on GPU
+
+            # Accumulate gradients across all scenes
+            for scene_batch in scene_batches:
+                scene_name = scene_batch["scene_name"]
+                scene_weight = scene_batch["scene_weight"]
+                scene_cameras = scene_batch["cameras"]
+
+                tokens_mean = scene_batch["tokens_mean"].cuda()
+                canonical = canonical_head(tokens_mean)
+
+                # Direct loss accumulation (no list, no stack)
+                scene_loss = torch.tensor(0.0, device="cuda")
+                last_rendered = None
+
+                for i, fidx in enumerate(scene_batch["frame_indices"]):
+                    # For stage 1, no deformation (canonical only)
+                    means3D, scales, rotations, opacity, shs = compose_gaussians(canonical)
+
+                    for cam_name in scene_batch["cam_names"]:
+                        cam = scene_cameras[cam_name]
+                        gt = scene_batch["gt_images"][cam_name][i].cuda()
+
+                        rendered, radii, depth, _ = render_gaussians(
+                            means3D, scales, rotations, opacity, shs, cam, bg_color, sh_degree
+                        )
+
+                        loss = photometric_loss(rendered, gt, lambda_ssim=0.2)
+                        scene_loss = scene_loss + loss  # Direct accumulation
+                        total_psnr += compute_psnr(rendered, gt)
+                        total_renders += 1
+
+                        # Keep last rendered for saving, clean up others
+                        last_rendered = rendered.detach()
+                        del radii, depth, gt
+
+                # Normalize scene loss by number of renders
+                num_scene_renders = len(scene_batch["frame_indices"]) * len(scene_batch["cam_names"])
+                scene_loss = scene_loss / max(num_scene_renders, 1)
+
+                # Apply scene weight and accumulate into total loss
+                weighted_scene_loss = scene_loss * scene_weight / len(scene_batches)
+                total_loss = total_loss + weighted_scene_loss
+
+            # Single backward call for all scenes
+            total_loss.backward()
+
+            # Single optimizer step after all scenes
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(canonical_head.parameters(), grad_clip)
+            optimizer_s1.step()
             scheduler_s1.step()
 
-    torch.cuda.reset_peak_memory_stats()
+            # Get loss for logging (single .item() call)
+            avg_loss = total_loss.item()
+            avg_psnr = total_psnr / max(total_renders, 1)
 
-    pbar = tqdm(range(start_step_s1, s1_steps if resume_stage <= 1 else 0), desc="Stage 1 (Canonical)")
-    for step in pbar:
-        optimizer_s1.zero_grad()
+            vram_alloc, vram_peak = get_vram_gb()
+            pbar.set_postfix({
+                "loss": f"{avg_loss:.4f}",
+                "psnr": f"{avg_psnr:.1f}",
+                "vram": f"{vram_alloc:.1f}GB",
+            })
 
-        # Sample batches from all scenes
-        scene_batches = multi_dataset.sample_multi_scene_batch(s1_batch_frames, s1_supervision_cams)
+            writer.add_scalar("stage1/loss", avg_loss, step)
+            writer.add_scalar("stage1/psnr", avg_psnr, step)
 
-        total_psnr = 0.0
-        total_renders = 0
-        total_loss = torch.tensor(0.0, device="cuda")  # Accumulate on GPU
+            if step % cfg["logging"]["save_render_every"] == 0:
+                save_render(last_rendered, os.path.join(render_dir, "stage1", f"step_{step:05d}.jpg"))
 
-        # Accumulate gradients across all scenes
-        for scene_batch in scene_batches:
-            scene_name = scene_batch["scene_name"]
-            scene_weight = scene_batch["scene_weight"]
-            scene_cameras = scene_batch["cameras"]
+            if step % cfg["training"]["save_ckpt_every"] == 0 and step > 0:
+                save_checkpoint(
+                    os.path.join(ckpt_dir, f"stage1_step{step}.pt"),
+                    step, canonical_head, deformation_head, optimizer_s1
+                )
 
-            tokens_mean = scene_batch["tokens_mean"].cuda()
-            canonical = canonical_head(tokens_mean)
-
-            # Direct loss accumulation (no list, no stack)
-            scene_loss = torch.tensor(0.0, device="cuda")
-            last_rendered = None
-
-            for i, fidx in enumerate(scene_batch["frame_indices"]):
-                # For stage 1, no deformation (canonical only)
-                means3D, scales, rotations, opacity, shs = compose_gaussians(canonical)
-
-                for cam_name in scene_batch["cam_names"]:
-                    cam = scene_cameras[cam_name]
-                    gt = scene_batch["gt_images"][cam_name][i].cuda()
-
-                    rendered, radii, depth, _ = render_gaussians(
-                        means3D, scales, rotations, opacity, shs, cam, bg_color, sh_degree
-                    )
-
-                    loss = photometric_loss(rendered, gt, lambda_ssim=0.2)
-                    scene_loss = scene_loss + loss  # Direct accumulation
-                    total_psnr += compute_psnr(rendered, gt)
-                    total_renders += 1
-
-                    # Keep last rendered for saving, clean up others
-                    last_rendered = rendered.detach()
-                    del radii, depth, gt
-
-            # Normalize scene loss by number of renders
-            num_scene_renders = len(scene_batch["frame_indices"]) * len(scene_batch["cam_names"])
-            scene_loss = scene_loss / max(num_scene_renders, 1)
-
-            # Apply scene weight and accumulate into total loss
-            weighted_scene_loss = scene_loss * scene_weight / len(scene_batches)
-            total_loss = total_loss + weighted_scene_loss
-
-        # Single backward call for all scenes
-        total_loss.backward()
-
-        # Single optimizer step after all scenes
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(canonical_head.parameters(), grad_clip)
-        optimizer_s1.step()
-        scheduler_s1.step()
-
-        # Get loss for logging (single .item() call)
-        avg_loss = total_loss.item()
-        avg_psnr = total_psnr / max(total_renders, 1)
-
-        vram_alloc, vram_peak = get_vram_gb()
-        pbar.set_postfix({
-            "loss": f"{avg_loss:.4f}",
-            "psnr": f"{avg_psnr:.1f}",
-            "vram": f"{vram_alloc:.1f}GB",
-        })
-
-        writer.add_scalar("stage1/loss", avg_loss, step)
-        writer.add_scalar("stage1/psnr", avg_psnr, step)
-
-        if step % cfg["logging"]["save_render_every"] == 0:
-            save_render(last_rendered, os.path.join(render_dir, "stage1", f"step_{step:05d}.jpg"))
-
-        if step % cfg["training"]["save_ckpt_every"] == 0 and step > 0:
-            save_checkpoint(
-                os.path.join(ckpt_dir, f"stage1_step{step}.pt"),
-                step, canonical_head, deformation_head, optimizer_s1
-            )
-
-    save_checkpoint(
-        os.path.join(ckpt_dir, "stage1_final.pt"),
-        s1_steps, canonical_head, deformation_head, optimizer_s1
-    )
-    print(f"\nStage 1 complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
-    torch.cuda.empty_cache()
+        save_checkpoint(
+            os.path.join(ckpt_dir, "stage1_final.pt"),
+            s1_steps, canonical_head, deformation_head, optimizer_s1
+        )
+        print(f"\nStage 1 complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
+        torch.cuda.empty_cache()
 
     # ===== STAGE 2 & 3: DISABLED FOR ADAPTIVE SCALE EXPERIMENT =====
     # Stages 2 and 3 are commented out to test stage 1 only
@@ -417,182 +417,186 @@ def train(config_path: str, resume_stage: int = 1, restart_latest: bool = False)
         print("STAGE 2: Training Deformation Head (Multi-Scene)")
         print("=" * 60)
 
-    canonical_head.eval()
-    for p in canonical_head.parameters():
-        p.requires_grad = False
+        canonical_head.eval()
+        for p in canonical_head.parameters():
+            p.requires_grad = False
 
-    deformation_head.train()
+        deformation_head.train()
 
-    s2_steps = cfg["training"]["stage2_steps"]
-    s2_lr = cfg["training"]["stage2_lr"]
-    s2_batch_frames = cfg["training"]["stage2_batch_frames"]
-    s2_supervision_cams = cfg["training"]["stage2_supervision_cams"]
-    s2_weights = cfg["training"]["stage2_loss_weights"]
+        s2_steps = cfg["training"]["stage2_steps"]
+        s2_lr = cfg["training"]["stage2_lr"]
+        s2_batch_frames = cfg["training"]["stage2_batch_frames"]
+        s2_supervision_cams = cfg["training"]["stage2_supervision_cams"]
+        s2_weights = cfg["training"]["stage2_loss_weights"]
 
-    optimizer_s2 = optim.AdamW(deformation_head.parameters(), lr=s2_lr)
-    scheduler_s2 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s2, T_max=s2_steps)
+        optimizer_s2 = optim.AdamW(deformation_head.parameters(), lr=s2_lr)
+        scheduler_s2 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s2, T_max=s2_steps)
 
-    # If restarting within stage 2, load optimizer state and advance scheduler
-    start_step_s2 = 0
-    if should_continue_stage2:
-        print(f"  Continuing Stage 2 from step {restart_from_step}")
-        start_step_s2 = restart_from_step
-        if "optimizer" in ckpt:
-            optimizer_s2.load_state_dict(ckpt["optimizer"])
-        # Advance scheduler to correct position
-        for _ in range(restart_from_step):
+        # If restarting within stage 2, load optimizer state and advance scheduler
+        start_step_s2 = 0
+        if should_continue_stage2:
+            print(f"  Continuing Stage 2 from step {restart_from_step}")
+            start_step_s2 = restart_from_step
+            if "optimizer" in ckpt:
+                optimizer_s2.load_state_dict(ckpt["optimizer"])
+            # Advance scheduler to correct position
+            for _ in range(restart_from_step):
+                scheduler_s2.step()
+
+        torch.cuda.reset_peak_memory_stats()
+
+        pbar = tqdm(range(start_step_s2, s2_steps), desc="Stage 2 (Deformation)")
+        for step in pbar:
+            optimizer_s2.zero_grad()
+
+            scene_batches = multi_dataset.sample_multi_scene_batch(s2_batch_frames, s2_supervision_cams)
+
+            total_psnr = 0.0
+            total_renders = 0
+            total_loss = torch.tensor(0.0, device="cuda")  # Accumulate on GPU
+            per_scene_losses = {}
+            delta_magnitudes = []  # Track delta magnitudes for debugging
+
+            for scene_batch in scene_batches:
+                scene_name = scene_batch["scene_name"]
+                scene_weight = scene_batch["scene_weight"]
+                scene_cameras = scene_batch["cameras"]
+    
+                tokens_mean = scene_batch["tokens_mean"].cuda()
+    
+                with torch.no_grad():
+                    canonical = canonical_head(tokens_mean)
+    
+                # Direct loss accumulation (no list, no stack)
+                scene_loss = torch.tensor(0.0, device="cuda")
+                last_rendered = None
+                prev_all_deltas = None  # For TV loss between consecutive frames
+    
+                for i, fidx in enumerate(scene_batch["frame_indices"]):
+                    tokens_t = scene_batch["tokens_frames"][i].cuda()
+    
+                    # Deformation: predict deltas from per-frame tokens
+                    deltas = deformation_head(tokens_t)
+    
+                    # Track delta magnitudes for debugging
+                    delta_magnitudes.append(deltas["dxyz"].abs().mean().item())
+    
+                    means3D, scales, rotations, opacity, shs = compose_gaussians(canonical, deltas)
+    
+                    for cam_name in scene_batch["cam_names"]:
+                        cam = scene_cameras[cam_name]
+                        gt = scene_batch["gt_images"][cam_name][i].cuda()
+    
+                        rendered, radii, depth, _ = render_gaussians(
+                            means3D, scales, rotations, opacity, shs, cam, bg_color, sh_degree
+                        )
+    
+                        loss = photometric_loss(rendered, gt, lambda_ssim=0.2)
+                        scene_loss = scene_loss + loss  # Direct accumulation
+                        total_psnr += compute_psnr(rendered, gt)
+                        total_renders += 1
+    
+                        # Keep last rendered for saving, clean up others
+                        last_rendered = rendered.detach()
+                        del radii, depth, gt
+    
+                    # TV loss: encourage temporally smooth deformations
+                    if prev_all_deltas is not None:
+                        tv_weight = s2_weights.get("tv", 0.01)
+                        scene_loss = scene_loss + tv_weight * tv_loss(deltas["all_deltas"], prev_all_deltas)
+                    prev_all_deltas = deltas["all_deltas"].detach()
+    
+                # Normalize scene loss by number of renders
+                num_scene_renders = len(scene_batch["frame_indices"]) * len(scene_batch["cam_names"])
+                scene_loss = scene_loss / max(num_scene_renders, 1)
+    
+                # Store per-scene loss for logging
+                per_scene_losses[scene_name] = scene_loss.item()
+    
+                # Apply scene weight and accumulate into total loss
+                weighted_scene_loss = scene_loss * scene_weight / len(scene_batches)
+                total_loss = total_loss + weighted_scene_loss
+    
+            # Single backward call for all scenes
+            total_loss.backward()
+    
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(deformation_head.parameters(), grad_clip)
+            optimizer_s2.step()
             scheduler_s2.step()
-
-    torch.cuda.reset_peak_memory_stats()
-
-    pbar = tqdm(range(start_step_s2, s2_steps if resume_stage <= 2 else 0), desc="Stage 2 (Deformation)")
-    for step in pbar:
-        optimizer_s2.zero_grad()
-
-        scene_batches = multi_dataset.sample_multi_scene_batch(s2_batch_frames, s2_supervision_cams)
-
-        total_psnr = 0.0
-        total_renders = 0
-        total_loss = torch.tensor(0.0, device="cuda")  # Accumulate on GPU
-        per_scene_losses = {}
-        delta_magnitudes = []  # Track delta magnitudes for debugging
-
-        for scene_batch in scene_batches:
-            scene_name = scene_batch["scene_name"]
-            scene_weight = scene_batch["scene_weight"]
-            scene_cameras = scene_batch["cameras"]
-
-            tokens_mean = scene_batch["tokens_mean"].cuda()
-
-            with torch.no_grad():
-                canonical = canonical_head(tokens_mean)
-
-            # Direct loss accumulation (no list, no stack)
-            scene_loss = torch.tensor(0.0, device="cuda")
-            last_rendered = None
-            prev_all_deltas = None  # For TV loss between consecutive frames
-
-            for i, fidx in enumerate(scene_batch["frame_indices"]):
-                tokens_t = scene_batch["tokens_frames"][i].cuda()
-
-                # Deformation: predict deltas from per-frame tokens
-                deltas = deformation_head(tokens_t)
-
-                # Track delta magnitudes for debugging
-                delta_magnitudes.append(deltas["dxyz"].abs().mean().item())
-
-                means3D, scales, rotations, opacity, shs = compose_gaussians(canonical, deltas)
-
-                for cam_name in scene_batch["cam_names"]:
-                    cam = scene_cameras[cam_name]
-                    gt = scene_batch["gt_images"][cam_name][i].cuda()
-
-                    rendered, radii, depth, _ = render_gaussians(
-                        means3D, scales, rotations, opacity, shs, cam, bg_color, sh_degree
-                    )
-
-                    loss = photometric_loss(rendered, gt, lambda_ssim=0.2)
-                    scene_loss = scene_loss + loss  # Direct accumulation
-                    total_psnr += compute_psnr(rendered, gt)
-                    total_renders += 1
-
-                    # Keep last rendered for saving, clean up others
-                    last_rendered = rendered.detach()
-                    del radii, depth, gt
-
-                # TV loss: encourage temporally smooth deformations
-                if prev_all_deltas is not None:
-                    tv_weight = s2_weights.get("tv", 0.01)
-                    scene_loss = scene_loss + tv_weight * tv_loss(deltas["all_deltas"], prev_all_deltas)
-                prev_all_deltas = deltas["all_deltas"].detach()
-
-            # Normalize scene loss by number of renders
-            num_scene_renders = len(scene_batch["frame_indices"]) * len(scene_batch["cam_names"])
-            scene_loss = scene_loss / max(num_scene_renders, 1)
-
-            # Store per-scene loss for logging
-            per_scene_losses[scene_name] = scene_loss.item()
-
-            # Apply scene weight and accumulate into total loss
-            weighted_scene_loss = scene_loss * scene_weight / len(scene_batches)
-            total_loss = total_loss + weighted_scene_loss
-
-        # Single backward call for all scenes
-        total_loss.backward()
-
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(deformation_head.parameters(), grad_clip)
-        optimizer_s2.step()
-        scheduler_s2.step()
-
-        # Get loss for logging (single .item() call)
-        avg_loss = total_loss.item()
-        avg_psnr = total_psnr / max(total_renders, 1)
-        avg_delta_mag = sum(delta_magnitudes) / max(len(delta_magnitudes), 1)
-
-        vram_alloc, vram_peak = get_vram_gb()
-        pbar.set_postfix({
-            "loss": f"{avg_loss:.4f}",
-            "psnr": f"{avg_psnr:.1f}",
-            "Δ": f"{avg_delta_mag:.4f}",
-            "vram": f"{vram_alloc:.1f}GB",
-        })
-
-        writer.add_scalar("stage2/loss", avg_loss, step)
-        writer.add_scalar("stage2/psnr", avg_psnr, step)
-        writer.add_scalar("stage2/delta_magnitude", avg_delta_mag, step)
-
-        # Log per-scene losses
-        for scene_name, scene_loss_val in per_scene_losses.items():
-            writer.add_scalar(f"stage2/loss_{scene_name}", scene_loss_val, step)
-
-        if step % cfg["logging"]["save_render_every"] == 0:
-            save_render(last_rendered, os.path.join(render_dir, "stage2", f"step_{step:05d}.jpg"))
-
-        if step % cfg["training"]["save_ckpt_every"] == 0 and step > 0:
-            save_checkpoint(
-                os.path.join(ckpt_dir, f"stage2_step{step}.pt"),
-                step, canonical_head, deformation_head, optimizer_s2
-            )
-
-        # Evaluation
-        if step % cfg["training"]["eval_every"] == 0:
-            with torch.no_grad():
-                eval_psnrs = {}
-                for scene_info in multi_dataset.scenes:
-                    scene_name = scene_info["name"]
-                    dataset = scene_info["dataset"]
-                    cameras = scene_info["cameras"]
-                    eval_cam_name = scene_info["eval_camera"]
-
-                    tokens_mean_eval = dataset.get_tokens_mean().cuda()
-                    canonical_eval = canonical_head(tokens_mean_eval)
-                    tokens_t_eval = dataset.get_tokens_frame(0).cuda()
-                    deltas_eval = deformation_head(tokens_t_eval)
-                    m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval)
-
-                    eval_cam = cameras[eval_cam_name]
-                    gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
-                    rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
-                    novel_psnr = compute_psnr(rendered_novel, gt_novel)
-                    eval_psnrs[scene_name] = novel_psnr
-
-                    writer.add_scalar(f"stage2/eval_psnr_{scene_name}", novel_psnr, step)
-
-                eval_str = ", ".join([f"{name}={psnr:.1f}" for name, psnr in eval_psnrs.items()])
-                tqdm.write(f"  Step {step}: {eval_str} dB")
-
-    save_checkpoint(
-        os.path.join(ckpt_dir, "stage2_final.pt"),
-        s2_steps, canonical_head, deformation_head, optimizer_s2
-    )
-    print(f"\nStage 2 complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
-    torch.cuda.empty_cache()
+    
+            # Get loss for logging (single .item() call)
+            avg_loss = total_loss.item()
+            avg_psnr = total_psnr / max(total_renders, 1)
+            avg_delta_mag = sum(delta_magnitudes) / max(len(delta_magnitudes), 1)
+    
+            vram_alloc, vram_peak = get_vram_gb()
+            pbar.set_postfix({
+                "loss": f"{avg_loss:.4f}",
+                "psnr": f"{avg_psnr:.1f}",
+                "Δ": f"{avg_delta_mag:.4f}",
+                "vram": f"{vram_alloc:.1f}GB",
+            })
+    
+            writer.add_scalar("stage2/loss", avg_loss, step)
+            writer.add_scalar("stage2/psnr", avg_psnr, step)
+            writer.add_scalar("stage2/delta_magnitude", avg_delta_mag, step)
+    
+            # Log per-scene losses
+            for scene_name, scene_loss_val in per_scene_losses.items():
+                writer.add_scalar(f"stage2/loss_{scene_name}", scene_loss_val, step)
+    
+            if step % cfg["logging"]["save_render_every"] == 0:
+                save_render(last_rendered, os.path.join(render_dir, "stage2", f"step_{step:05d}.jpg"))
+    
+            if step % cfg["training"]["save_ckpt_every"] == 0 and step > 0:
+                save_checkpoint(
+                    os.path.join(ckpt_dir, f"stage2_step{step}.pt"),
+                    step, canonical_head, deformation_head, optimizer_s2
+                )
+    
+            # Evaluation
+            if step % cfg["training"]["eval_every"] == 0:
+                with torch.no_grad():
+                    eval_psnrs = {}
+                    for scene_info in multi_dataset.scenes:
+                        scene_name = scene_info["name"]
+                        dataset = scene_info["dataset"]
+                        cameras = scene_info["cameras"]
+                        eval_cam_name = scene_info["eval_camera"]
+    
+                        tokens_mean_eval = dataset.get_tokens_mean().cuda()
+                        canonical_eval = canonical_head(tokens_mean_eval)
+                        tokens_t_eval = dataset.get_tokens_frame(0).cuda()
+                        deltas_eval = deformation_head(tokens_t_eval)
+                        m3d, sc, rot, op, sh = compose_gaussians(canonical_eval, deltas_eval)
+    
+                        eval_cam = cameras[eval_cam_name]
+                        gt_novel = dataset.load_frame_image(eval_cam_name, 0).cuda()
+                        rendered_novel, _, _, _ = render_gaussians(m3d, sc, rot, op, sh, eval_cam, bg_color, sh_degree)
+                        novel_psnr = compute_psnr(rendered_novel, gt_novel)
+                        eval_psnrs[scene_name] = novel_psnr
+    
+                        writer.add_scalar(f"stage2/eval_psnr_{scene_name}", novel_psnr, step)
+    
+                    eval_str = ", ".join([f"{name}={psnr:.1f}" for name, psnr in eval_psnrs.items()])
+                    tqdm.write(f"  Step {step}: {eval_str} dB")
+    
+        save_checkpoint(
+            os.path.join(ckpt_dir, "stage2_final.pt"),
+            s2_steps, canonical_head, deformation_head, optimizer_s2
+        )
+        print(f"\nStage 2 complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
+        torch.cuda.empty_cache()
 
     # ===== STAGE 3: Joint Fine-tuning =====
+    should_skip_stage3 = (restart_from_stage and restart_from_stage > 3)
     should_continue_stage3 = (restart_from_stage == 3 and restart_from_step is not None)
 
-    if cfg["training"].get("stage3_steps", 0) > 0:
+    if should_skip_stage3:
+        if restart_from_stage:
+            print(f"\n  Skipping Stage 3 (restarting from stage {restart_from_stage})")
+    elif cfg["training"].get("stage3_steps", 0) > 0:
         print("\n" + "=" * 60)
         print("STAGE 3: Joint Fine-tuning (Both Heads, Multi-Scene)")
         print("=" * 60)
