@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from pytorch_msssim import ssim as compute_ssim
+import lpips as lpips_lib
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,23 @@ def tv_loss(
 
 
 # ---------------------------------------------------------------------------
+# Lazy LPIPS singleton
+# ---------------------------------------------------------------------------
+
+_lpips_net = None
+
+def _get_lpips_net(device="cuda"):
+    """Lazy-load LPIPS AlexNet (shared singleton)."""
+    global _lpips_net
+    if _lpips_net is None:
+        _lpips_net = lpips_lib.LPIPS(net="alex").to(device)
+        _lpips_net.eval()
+        for p in _lpips_net.parameters():
+            p.requires_grad = False
+    return _lpips_net
+
+
+# ---------------------------------------------------------------------------
 # Adapter functions — bridge raw losses to the registry interface
 # fn(predictions, targets, **kwargs) -> tensor
 # ---------------------------------------------------------------------------
@@ -180,6 +198,27 @@ def _opacity_reg_adapter(predictions: dict, targets: dict, **kwargs) -> torch.Te
     return opacity_regularization(predictions["opacity"])
 
 
+def _lpips_adapter(predictions: dict, targets: dict, **kwargs) -> torch.Tensor:
+    """LPIPS perceptual loss with optional downsampling."""
+    rendered = predictions["rendered"]
+    target = targets["gt_image"]
+    downsample = kwargs.get("downsample", 1)
+
+    if rendered.dim() == 3:
+        rendered = rendered.unsqueeze(0)
+    if target.dim() == 3:
+        target = target.unsqueeze(0)
+
+    if downsample > 1:
+        rendered = F.interpolate(rendered, scale_factor=1.0/downsample, mode="bilinear",
+                                 align_corners=False)
+        target = F.interpolate(target, scale_factor=1.0/downsample, mode="bilinear",
+                               align_corners=False)
+
+    net = _get_lpips_net(rendered.device)
+    return net(rendered * 2 - 1, target * 2 - 1).mean()
+
+
 # ---------------------------------------------------------------------------
 # LossRegistry
 # ---------------------------------------------------------------------------
@@ -208,6 +247,7 @@ class LossRegistry:
         self.register("tv", _tv_adapter)
         self.register("scale_reg", _scale_reg_adapter)
         self.register("opacity_reg", _opacity_reg_adapter)
+        self.register("lpips", _lpips_adapter)
 
     def register(self, name: str, loss_fn: callable) -> None:
         """Register a loss function under ``name``.
