@@ -40,6 +40,65 @@ def save_checkpoint(path, step, canonical_head, deformation_head, optimizer):
     }, path)
 
 
+def find_latest_checkpoint(ckpt_dir):
+    """Find the most recent checkpoint in the checkpoint directory.
+
+    Returns:
+        (checkpoint_path, stage, step) or (None, None, None) if no checkpoint found
+    """
+    # Check in priority order: stage 3 > stage 2 > stage 1
+    # Within each stage, prefer highest step number
+    checkpoint_patterns = [
+        ("stage3_step*.pt", 3),  # Stage 3 intermediate checkpoints
+        ("stage3_final.pt", 3),  # Stage 3 final
+        ("stage2_step*.pt", 2),  # Stage 2 intermediate checkpoints
+        ("stage2_final.pt", 2),  # Stage 2 final
+        ("stage1_step*.pt", 1),  # Stage 1 intermediate checkpoints
+        ("stage1_final.pt", 1),  # Stage 1 final
+    ]
+
+    latest_ckpt = None
+    latest_step = -1
+    latest_stage = None
+
+    # Iterate through stages in priority order
+    for pattern, stage in checkpoint_patterns:
+        # Skip to next stage if we already found a checkpoint in a higher stage
+        if latest_stage is not None and stage < latest_stage:
+            continue
+
+        ckpt_paths = glob.glob(os.path.join(ckpt_dir, pattern))
+
+        for ckpt_path in ckpt_paths:
+            # Extract step number from intermediate checkpoints
+            if "step" in pattern and "*" in pattern:
+                basename = os.path.basename(ckpt_path)
+                # Extract number from "stageN_stepXXXX.pt"
+                try:
+                    step = int(basename.split("step")[1].split(".pt")[0])
+                except (IndexError, ValueError):
+                    continue
+            else:
+                # For final checkpoints, load to get step
+                try:
+                    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                    step = ckpt.get("step", 0)
+                except:
+                    continue
+
+            # Track the checkpoint with highest step number within this stage
+            # If we found a higher stage, reset the comparison
+            if latest_stage is None or stage > latest_stage:
+                latest_step = step
+                latest_ckpt = ckpt_path
+                latest_stage = stage
+            elif stage == latest_stage and step > latest_step:
+                latest_step = step
+                latest_ckpt = ckpt_path
+
+    return latest_ckpt, latest_stage, latest_step
+
+
 def save_render(rendered, path):
     import cv2
     img = (rendered.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
@@ -51,8 +110,14 @@ def tv_loss(deltas_t: torch.Tensor, deltas_prev: torch.Tensor) -> torch.Tensor:
     return (deltas_t - deltas_prev).pow(2).mean()
 
 
-def train(config_path: str, resume_stage: int = 1):
-    """Main training function. resume_stage: 1=full, 2=skip stage1, 3=skip stage1+2."""
+def train(config_path: str, resume_stage: int = 1, restart_latest: bool = False):
+    """Main training function.
+
+    Args:
+        config_path: Path to config YAML
+        resume_stage: 1=full, 2=skip stage1, 3=skip stage1+2
+        restart_latest: If True, find and load the most recent checkpoint, continuing from that step
+    """
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -166,8 +231,32 @@ def train(config_path: str, resume_stage: int = 1):
     sh_degree = cfg["model"]["sh_degree"]
     grad_clip = cfg["training"].get("grad_clip_max_norm", 0.0)
 
-    # Load checkpoint if resuming from a later stage
-    if resume_stage > 1:
+    # Handle checkpoint loading
+    restart_from_step = None
+    restart_from_stage = None
+
+    if restart_latest:
+        # Find and load the most recent checkpoint
+        latest_ckpt, latest_stage, latest_step = find_latest_checkpoint(ckpt_dir)
+        if latest_ckpt is not None:
+            print(f"\n{'='*60}")
+            print(f"RESTART MODE: Loading latest checkpoint")
+            print(f"  Checkpoint: {os.path.basename(latest_ckpt)}")
+            print(f"  Stage: {latest_stage}")
+            print(f"  Step: {latest_step}")
+            print(f"{'='*60}\n")
+            ckpt = torch.load(latest_ckpt, weights_only=False)
+            canonical_head.load_state_dict(ckpt["canonical_head"])
+            deformation_head.load_state_dict(ckpt["deformation_head"])
+            restart_from_step = latest_step
+            restart_from_stage = latest_stage
+        else:
+            print(f"\n{'='*60}")
+            print(f"WARNING: --restart-latest specified but no checkpoints found")
+            print(f"Starting training from scratch")
+            print(f"{'='*60}\n")
+    elif resume_stage > 1:
+        # Load checkpoint for stage skipping (original behavior)
         ckpt_path = os.path.join(ckpt_dir, "stage1_final.pt")
         if resume_stage >= 3:
             ckpt_path = os.path.join(ckpt_dir, "stage2_final.pt")
@@ -182,8 +271,13 @@ def train(config_path: str, resume_stage: int = 1):
     start_time = time.time()
 
     # ===== STAGE 1: Canonical Head Only =====
-    if resume_stage > 1:
-        print("\n  Skipping Stage 1 (resuming from stage {})".format(resume_stage))
+    should_skip_stage1 = (resume_stage > 1) or (restart_from_stage and restart_from_stage > 1)
+
+    if should_skip_stage1:
+        if restart_from_stage:
+            print(f"\n  Skipping Stage 1 (restarting from stage {restart_from_stage})")
+        else:
+            print(f"\n  Skipping Stage 1 (resuming from stage {resume_stage})")
     else:
         print("\n" + "=" * 60)
         print("STAGE 1: Training Canonical Head (Multi-Scene)")
@@ -200,9 +294,21 @@ def train(config_path: str, resume_stage: int = 1):
     optimizer_s1 = optim.AdamW(canonical_head.parameters(), lr=s1_lr)
     scheduler_s1 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s1, T_max=s1_steps)
 
+    # If restarting within stage 1, load optimizer state and advance scheduler
+    should_continue_stage1 = (restart_from_stage == 1 and restart_from_step is not None)
+    start_step_s1 = 0
+    if should_continue_stage1:
+        print(f"  Continuing Stage 1 from step {restart_from_step}")
+        start_step_s1 = restart_from_step
+        if "optimizer" in ckpt:
+            optimizer_s1.load_state_dict(ckpt["optimizer"])
+        # Advance scheduler to correct position
+        for _ in range(restart_from_step):
+            scheduler_s1.step()
+
     torch.cuda.reset_peak_memory_stats()
 
-    pbar = tqdm(range(s1_steps if resume_stage <= 1 else 0), desc="Stage 1 (Canonical)")
+    pbar = tqdm(range(start_step_s1, s1_steps if resume_stage <= 1 else 0), desc="Stage 1 (Canonical)")
     for step in pbar:
         optimizer_s1.zero_grad()
 
@@ -298,8 +404,14 @@ def train(config_path: str, resume_stage: int = 1):
     # Stages 2 and 3 are commented out to test stage 1 only
 
     # ===== STAGE 2: Deformation Head Only =====
-    if resume_stage > 2:
-        print("\n  Skipping Stage 2 (resuming from stage {})".format(resume_stage))
+    should_skip_stage2 = (resume_stage > 2) or (restart_from_stage and restart_from_stage > 2)
+    should_continue_stage2 = (restart_from_stage == 2 and restart_from_step is not None)
+
+    if should_skip_stage2:
+        if restart_from_stage:
+            print(f"\n  Skipping Stage 2 (restarting from stage {restart_from_stage})")
+        else:
+            print(f"\n  Skipping Stage 2 (resuming from stage {resume_stage})")
     else:
         print("\n" + "=" * 60)
         print("STAGE 2: Training Deformation Head (Multi-Scene)")
@@ -320,9 +432,20 @@ def train(config_path: str, resume_stage: int = 1):
     optimizer_s2 = optim.AdamW(deformation_head.parameters(), lr=s2_lr)
     scheduler_s2 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s2, T_max=s2_steps)
 
+    # If restarting within stage 2, load optimizer state and advance scheduler
+    start_step_s2 = 0
+    if should_continue_stage2:
+        print(f"  Continuing Stage 2 from step {restart_from_step}")
+        start_step_s2 = restart_from_step
+        if "optimizer" in ckpt:
+            optimizer_s2.load_state_dict(ckpt["optimizer"])
+        # Advance scheduler to correct position
+        for _ in range(restart_from_step):
+            scheduler_s2.step()
+
     torch.cuda.reset_peak_memory_stats()
 
-    pbar = tqdm(range(s2_steps if resume_stage <= 2 else 0), desc="Stage 2 (Deformation)")
+    pbar = tqdm(range(start_step_s2, s2_steps if resume_stage <= 2 else 0), desc="Stage 2 (Deformation)")
     for step in pbar:
         optimizer_s2.zero_grad()
 
@@ -467,6 +590,8 @@ def train(config_path: str, resume_stage: int = 1):
     torch.cuda.empty_cache()
 
     # ===== STAGE 3: Joint Fine-tuning =====
+    should_continue_stage3 = (restart_from_stage == 3 and restart_from_step is not None)
+
     if cfg["training"].get("stage3_steps", 0) > 0:
         print("\n" + "=" * 60)
         print("STAGE 3: Joint Fine-tuning (Both Heads, Multi-Scene)")
@@ -490,9 +615,20 @@ def train(config_path: str, resume_stage: int = 1):
         )
         scheduler_s3 = optim.lr_scheduler.CosineAnnealingLR(optimizer_s3, T_max=s3_steps)
 
+        # If restarting within stage 3, load optimizer state and advance scheduler
+        start_step_s3 = 0
+        if should_continue_stage3:
+            print(f"  Continuing Stage 3 from step {restart_from_step}")
+            start_step_s3 = restart_from_step
+            if "optimizer" in ckpt:
+                optimizer_s3.load_state_dict(ckpt["optimizer"])
+            # Advance scheduler to correct position
+            for _ in range(restart_from_step):
+                scheduler_s3.step()
+
         torch.cuda.reset_peak_memory_stats()
 
-        pbar = tqdm(range(s3_steps), desc="Stage 3 (Joint)")
+        pbar = tqdm(range(start_step_s3, s3_steps), desc="Stage 3 (Joint)")
         for step in pbar:
             optimizer_s3.zero_grad()
 
@@ -612,6 +748,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
     parser.add_argument("--resume-stage", type=int, default=1,
                         help="Resume from stage N (1=full, 2=skip stage1, 3=skip stage1+2)")
+    parser.add_argument("--restart-latest", action="store_true",
+                        help="Restart from latest checkpoint")
     args = parser.parse_args()
 
-    train(args.config, resume_stage=args.resume_stage)
+    train(args.config, resume_stage=args.resume_stage, restart_latest=args.restart_latest)

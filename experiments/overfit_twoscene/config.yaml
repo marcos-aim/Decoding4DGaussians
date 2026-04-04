@@ -6,26 +6,26 @@ experiment_name: "multi_scene_training"
 # Scenes to train on
 scenes:
   - name: "coffee_martini"
-    cache_dir: "/home/codyreeth/Desktop/Decoding4DGaussians/experiments/overfit_twoscene/cache_coffee_martini"
+    cache_dir: "/home/codyreeth/Desktop/Decoding4DGaussians/cached_datasets/neu3d/cache_coffee_martini"
     poses_bounds_path: "/home/codyreeth/Desktop/Decoding4DGaussians/datasets/neu3d/coffee_martini/poses_bounds.npy"
     input_camera: "cam01"
     eval_camera: "cam00"
     weight: 1.0
 
   - name: "cook_spinach"
-    cache_dir: "/home/codyreeth/Desktop/Decoding4DGaussians/experiments/overfit_twoscene/cache_cook_spinach"
+    cache_dir: "/home/codyreeth/Desktop/Decoding4DGaussians/cached_datasets/neu3d/cache_cook_spinach"
     poses_bounds_path: "/home/codyreeth/Desktop/Decoding4DGaussians/datasets/neu3d/cook_spinach/poses_bounds.npy"
     input_camera: "cam01"
     eval_camera: "cam00"
     weight: 1.0
 
     
-  - name: "cut_roasted_beef"
-    cache_dir: "/home/codyreeth/Desktop/Decoding4DGaussians/experiments/overfit_twoscene/cache_cut_roasted_beef"
-    poses_bounds_path: "/home/codyreeth/Desktop/Decoding4DGaussians/datasets/neu3d/cut_roasted_beef/poses_bounds.npy"
-    input_camera: "cam01"
-    eval_camera: "cam00"
-    weight: 1.0
+  #- name: "cut_roasted_beef"
+    #cache_dir: "/home/codyreeth/Desktop/Decoding4DGaussians/experiments/overfit_twoscene/cache_cut_roasted_beef"
+    #poses_bounds_path: "/home/codyreeth/Desktop/Decoding4DGaussians/datasets/neu3d/cut_roasted_beef/poses_bounds.npy"
+    #input_camera: "cam01"
+    #eval_camera: "cam00"
+    #weight: 1.0
 
 # Model configuration
 model:
