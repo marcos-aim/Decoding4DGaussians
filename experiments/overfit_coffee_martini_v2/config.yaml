@@ -1,0 +1,104 @@
+engine:
+  amp: true
+  compile: true
+  compile_mode: default
+  grad_clip_max_norm: 1.0
+  log_every_n: 50
+  save_every_n: 2000
+  eval_every_n: 1000
+
+data:
+  scenes:
+    - name: coffee_martini
+      path: datasets/neural_3d/coffee_martini
+      precomputed: precomputed/coffee_martini
+  resolution: [512, 384]
+  batch_scenes: 1
+  batch_frames: 1
+  supervision_cams: 4
+  memory_strategy: pinned
+  input_camera: cam01
+  eval_camera: cam00
+
+precompute:
+  backbone: spatracker_v2
+  window_size: 8
+  dtype: bfloat16
+  output_dir: precomputed/
+
+phases:
+  - name: canonical
+    steps: 20000
+    trainable: [canonical_head]
+    optimizer:
+      type: adamw
+      lr: 1.0e-3
+      weight_decay: 0.01
+    scheduler:
+      type: cosine
+      warmup_steps: 500
+    losses:
+      rgb:
+        weight: 1.0
+      ssim:
+        weight: 0.85
+        warmup_steps: 500
+      geometric:
+        weight: 0.1
+      scale_reg:
+        weight: 0.01
+      opacity_reg:
+        weight: 0.01
+
+  - name: deformation
+    steps: 15000
+    trainable: [deformation_head]
+    optimizer:
+      type: adamw
+      lr: 5.0e-4
+    scheduler:
+      type: cosine
+      warmup_steps: 300
+    losses:
+      rgb:
+        weight: 1.0
+      ssim:
+        weight: 0.85
+      tv:
+        weight: 0.01
+      lpips:
+        weight: 0.1
+        compute_every_n: 5
+        downsample: 2
+      scale_reg:
+        weight: 0.01
+      opacity_reg:
+        weight: 0.01
+
+  - name: joint
+    steps: 10000
+    trainable: [canonical_head, deformation_head]
+    optimizer:
+      type: adamw
+      lr: 2.0e-4
+    scheduler:
+      type: cosine
+      warmup_steps: 200
+    losses:
+      rgb:
+        weight: 1.0
+      ssim:
+        weight: 0.85
+      tv:
+        weight: 0.005
+      lpips:
+        weight: 0.1
+        compute_every_n: 5
+        downsample: 2
+      scale_reg:
+        weight: 0.01
+      opacity_reg:
+        weight: 0.01
+
+distributed:
+  strategy: auto
