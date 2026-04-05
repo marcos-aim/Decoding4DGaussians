@@ -1,0 +1,104 @@
+experiment:
+  name: overfit_vggt_coffee_martini
+  scene: coffee_martini
+  mode: cross_attention_deformation
+  backbone: vggt  # annotation: using facebook/vggt-1b instead of SpaTrackerV2
+
+engine:
+  amp: false
+  compile: false
+  compile_mode: default
+  grad_clip_max_norm: 1.0
+  log_every_n: 100
+  save_every_n: 2000
+  eval_every_n: 1000
+
+data:
+  scenes:
+    - name: coffee_martini
+      path: D:/DecodeGaussians/datasets/neu3d/coffee_martini
+      precomputed: D:/DecodeGaussians/experiments/overfit_vggt_coffee_martini/cache
+  resolution: [518, 378]       # 518=37x14, 378=27x14 — exact VGGT patch multiples, no interpolation
+  batch_scenes: 1
+  batch_frames: 1
+  supervision_cams: 4
+  memory_strategy: pinned
+  input_camera: cam01
+  eval_camera: cam00
+
+model:
+  num_gaussians_per_patch: 128
+  canonical:
+    dim_in: 2048
+    dim_hidden: 1024
+    sh_degree: 0
+    dpt_dim: 512
+    grid_h: 27                 # 378/14 = 27
+    grid_w: 37                 # 518/14 = 37
+  deformation:
+    dim_canonical: 1024
+    dim_tokens: 2048
+    dim_hidden: 256
+    n_heads: 8
+    n_layers: 3
+    max_displacement: 2.0
+
+phases:
+  - name: canonical
+    steps: 20000
+    trainable: [canonical_head]
+    optimizer:
+      type: adamw
+      lr: 1.0e-3
+    scheduler:
+      type: cosine
+    losses:
+      rgb:
+        weight: 1.0
+      ssim:
+        weight: 0.85
+      geometric:
+        weight: 0.1
+
+  - name: deformation
+    steps: 20000
+    trainable: [deformation_head]
+    optimizer:
+      type: adamw
+      lr: 5.0e-4
+    scheduler:
+      type: cosine
+    losses:
+      rgb:
+        weight: 1.0
+      ssim:
+        weight: 0.85
+      tv:
+        weight: 0.01
+      scale_reg:
+        weight: 0.01
+      opacity_reg:
+        weight: 0.005
+
+  - name: joint
+    steps: 10000
+    trainable: [canonical_head, deformation_head]
+    optimizer:
+      type: adamw
+      lr: 1.0e-4
+    scheduler:
+      type: cosine
+    losses:
+      rgb:
+        weight: 1.0
+      ssim:
+        weight: 0.85
+      tv:
+        weight: 0.005
+      scale_reg:
+        weight: 0.01
+      opacity_reg:
+        weight: 0.005
+
+distributed:
+  strategy: auto
