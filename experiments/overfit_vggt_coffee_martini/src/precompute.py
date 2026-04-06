@@ -154,10 +154,17 @@ def precompute_vggt(cache_dir: str, cam_name: str, num_frames: int,
     torch.save(conf, os.path.join(cache_dir, "unc_metric.pt"))   # alias: train.py loads this name
     torch.save(conf, os.path.join(cache_dir, "pts3d_conf.pt"))   # kept separately for opacity init
 
+    # Save poses.pt so train.py's align_points_to_llff fires correctly.
+    # VGGT places frame 0 camera exactly at world origin (c2w = identity) by convention.
+    # The alignment code uses poses[0] to transform pts → cam0 space → scale → LLFF world.
+    # With c2w_0 = I, the cam0 transform is a no-op and depth-matching heuristic handles scale.
+    poses = torch.eye(4).unsqueeze(0).expand(len(all_tokens), -1, -1).contiguous()  # [T, 4, 4]
+    torch.save(poses.float(), os.path.join(cache_dir, "poses.pt"))
+
     del model
     torch.cuda.empty_cache()
     print("Done.")
-    print("NOTE: poses.pt intentionally not saved — train.py alignment guard will skip.")
+    print("Saved poses.pt as identity (VGGT frame-0 cam = world origin) to enable LLFF alignment.")
 
 
 def main():
@@ -187,11 +194,11 @@ def main():
     print("\n" + "=" * 60)
     print("Precompute complete!")
     print("=" * 60)
-    for f in ["tokens.pt", "points_map.pt", "unc_metric.pt", "pts3d_conf.pt"]:
+    for f in ["tokens.pt", "points_map.pt", "unc_metric.pt", "pts3d_conf.pt", "poses.pt"]:
         path = os.path.join(args.cache_dir, f)
         if os.path.exists(path):
             print(f"  {f}: {os.path.getsize(path) / 1e6:.1f} MB")
-    print("\nNot saved (intentional): poses.pt, intrs.pt")
+    print("\nNot saved (intentional): intrs.pt")
     print("Run training with:")
     print(f"  python src/train.py config.yaml")
 
