@@ -1,0 +1,64 @@
+experiment:
+  name: overfit_aea_loc3
+  scene: aea_loc3_script3_seq1_rec1
+  mode: cross_attention_deformation_aria
+
+paths:
+  aria_seq_root: datasets/aria/loc3_script3_seq1_rec1/recording/camera-rgb-rectified-600-h1000
+  spatracker_root: SpaTrackerV2
+  cache_dir: experiments/overfit_aea_loc3/cache
+  checkpoint_dir: experiments/overfit_aea_loc3/checkpoints
+  render_dir: experiments/overfit_aea_loc3/renders
+  log_dir: experiments/overfit_aea_loc3/logs
+
+data:
+  resolution: [504, 504]     # 4DGT's default input_image_res, square-ish Aria crop
+  start_frame: 0             # first frame of the 128-frame window
+  num_frames: 128            # 4DGT paper W=128
+  # 4DGT paper: N=16 input (every 8th); we use every 8th as our input subsample
+  input_subsample: 8
+  # Eval protocol: render every-other held-out frame (64/64 split). Overwritten by --eval_split on CLI.
+  eval_input_stride: 2
+
+model:
+  num_gaussians_per_patch: 128
+  canonical:
+    dim_in: 2048
+    dim_hidden: 1024
+    sh_degree: 0
+    dpt_dim: 512
+    grid_h: 36            # 504 / 14 (VGGT patch stride)
+    grid_w: 36
+  deformation:
+    dim_canonical: 1024
+    dim_tokens: 2048
+    dim_hidden: 256
+    n_heads: 8
+    n_layers: 3
+    max_displacement: 2.0
+
+training:
+  batch_frames: 1
+  supervision_cams: 1        # monocular — one pose per timestamp
+  grad_clip_max_norm: 1.0
+  scale_anneal_target: 1.0
+  stage1:
+    steps: 20000
+    lr: 1.0e-3
+    loss_weights: {rgb: 1.0, ssim: 0.85, geo: 0.1, depth: 0.0, scale_reg: 0.0, opacity_reg: 0.0}
+  stage2:
+    steps: 20000
+    lr: 5.0e-4
+    loss_weights: {rgb: 1.0, ssim: 0.85, tv: 0.01, scale_reg: 0.01, opacity_reg: 0.005}
+  stage3:
+    steps: 10000
+    lr: 1.0e-5
+    loss_weights: {rgb: 1.0, ssim: 0.85, tv: 0.005, scale_reg: 0.01, opacity_reg: 0.005}
+  checkpointing:
+    save_every: 2000
+    render_every: 500
+
+vram:
+  total_gb: 80.0           # A100/H100 on cluster
+  warn_threshold_gb: 70.0
+  oom_retry: true
