@@ -96,7 +96,7 @@ def load_model(config_path: str, checkpoint_path: str = None):
     ).cuda()
 
     if checkpoint_path is None:
-        stage3_path = os.path.join(ckpt_dir, "stage1_final.pt")
+        stage3_path = os.path.join(ckpt_dir, "stage3_final.pt")
         checkpoint_path = stage3_path if os.path.exists(stage3_path) else os.path.join(ckpt_dir, "stage2_final.pt")
 
     ckpt = torch.load(checkpoint_path, weights_only=False)
