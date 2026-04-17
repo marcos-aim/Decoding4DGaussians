@@ -7,6 +7,7 @@ Structural differences vs. dpt_hybrid_s3lr/train.py:
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -30,17 +31,101 @@ from losses import (compute_psnr, photometric_loss, geometric_loss,
                     scale_regularization, opacity_regularization)
 
 
-def build_input_indices(num_frames: int, input_subsample: int) -> list:
-    """Indices into the 128-frame window that are VISIBLE to the model.
-    4DGT default: every 8th frame → 16 input timestamps out of 128."""
-    return list(range(0, num_frames, input_subsample))
-
-
 def select_supervision_indices(num_frames: int, step: int) -> list:
-    """At each training step, pick one supervised frame index (or a few).
-    Monocular: pick ONE frame per step, randomly."""
+    """Monocular: pick ONE frame per step, randomly."""
     rng = np.random.default_rng(step)
     return [int(rng.integers(0, num_frames))]
+
+
+def build_heads(cfg, dataset):
+    """Construct canonical + deformation heads using the s3lr-reference init logic.
+
+    Computes grid_h/grid_w from the actual P in the cached tokens, derives
+    init_xyz_per_gaussian by mapping each pixel to a patch cell, and applies
+    resolution-aware init_log_scale / spread.
+    """
+    P = dataset.num_patches
+    K = cfg["model"].get("num_gaussians_per_patch", 128)
+    pts_mean = dataset.points_map.mean(dim=0)
+    H, W = pts_mean.shape[0], pts_mean.shape[1]
+    pts_flat = pts_mean.reshape(-1, 3)
+
+    grid_w = round((P * W / H) ** 0.5)
+    grid_h = round(P / grid_w)
+    while grid_w * grid_h < P:
+        grid_w += 1
+
+    patch_h = H / grid_h
+    patch_w = W / grid_w
+    pixel_y = torch.arange(H).float()
+    pixel_x = torch.arange(W).float()
+    yy, xx = torch.meshgrid(pixel_y, pixel_x, indexing="ij")
+    patch_idx_y = (yy / patch_h).long().clamp(0, grid_h - 1)
+    patch_idx_x = (xx / patch_w).long().clamp(0, grid_w - 1)
+    pixel_to_patch = (patch_idx_y * grid_w + patch_idx_x).reshape(-1)
+
+    pts_flat_cpu = pts_flat.detach().cpu()
+    init_xyz_per_gaussian = torch.zeros(P, K, 3)
+    for p in range(P):
+        mask = (pixel_to_patch == p)
+        pts_p = pts_flat_cpu[mask]
+        if pts_p.shape[0] == 0:
+            init_xyz_per_gaussian[p] = pts_flat_cpu.mean(dim=0).unsqueeze(0).expand(K, -1)
+        elif pts_p.shape[0] >= K:
+            idx = torch.linspace(0, pts_p.shape[0] - 1, K).long()
+            init_xyz_per_gaussian[p] = pts_p[idx]
+        else:
+            repeats = K // pts_p.shape[0] + 1
+            init_xyz_per_gaussian[p] = pts_p.repeat(repeats, 1)[:K]
+    init_xyz_per_gaussian = init_xyz_per_gaussian.reshape(P * K, 3)
+
+    indices = torch.linspace(0, pts_flat_cpu.shape[0] - 1, P).long()
+    init_xyz = pts_flat_cpu[indices]
+
+    REF_W = 512
+    res_scale = REF_W / W
+    init_log_scale = math.log(0.5 * res_scale)
+    spread = 0.05 * res_scale
+
+    can_cfg = cfg["model"]["canonical"]
+    dpt_dim = can_cfg.get("dpt_dim", 512)
+    cfg_grid_h = can_cfg.get("grid_h", grid_h)
+    cfg_grid_w = can_cfg.get("grid_w", grid_w)
+    if cfg_grid_h * cfg_grid_w < P:
+        print(f"[build_heads] WARNING: config grid {cfg_grid_h}x{cfg_grid_w}={cfg_grid_h*cfg_grid_w} "
+              f"< P={P}; falling back to computed grid {grid_h}x{grid_w}")
+        cfg_grid_h, cfg_grid_w = grid_h, grid_w
+
+    print(f"[build_heads] P={P} K={K} grid={cfg_grid_h}x{cfg_grid_w} "
+          f"res_scale={res_scale:.3f} init_log_scale={init_log_scale:.3f} spread={spread:.4f}")
+
+    canonical_head = HybridDPTCanonicalGaussianHead(
+        dim_in=can_cfg["dim_in"],
+        dim_hidden=can_cfg["dim_hidden"],
+        grid_h=cfg_grid_h,
+        grid_w=cfg_grid_w,
+        sh_degree=can_cfg["sh_degree"],
+        num_gaussians_per_patch=K,
+        init_xyz=init_xyz,
+        init_xyz_per_gaussian=init_xyz_per_gaussian,
+        init_log_scale=init_log_scale,
+        spread=spread,
+        dpt_dim=dpt_dim,
+    ).cuda()
+
+    defo_cfg = cfg["model"]["deformation"]
+    deformation_head = CrossAttentionDeformationHead(
+        dim_canonical=defo_cfg["dim_canonical"],
+        dim_tokens=defo_cfg["dim_tokens"],
+        dim_hidden=defo_cfg["dim_hidden"],
+        n_heads=defo_cfg["n_heads"],
+        n_layers=defo_cfg["n_layers"],
+        sh_degree=can_cfg["sh_degree"],
+        num_gaussians_per_patch=K,
+        max_displacement=defo_cfg.get("max_displacement", 2.0),
+    ).cuda()
+
+    return canonical_head, deformation_head
 
 
 def train_one_stage(cfg, stage_name, canonical_head, deformation_head,
@@ -166,23 +251,7 @@ def main():
         target_resolution=tuple(cfg["data"]["resolution"]),
     )
 
-    pts_mean = dataset.points_map.mean(dim=0)
-    H, W = pts_mean.shape[0], pts_mean.shape[1]
-    pts_flat = pts_mean.reshape(-1, 3)
-    K = cfg["model"]["num_gaussians_per_patch"]
-
-    canonical_head = HybridDPTCanonicalGaussianHead(
-        num_patches=dataset.num_patches,
-        num_gaussians_per_patch=K,
-        init_xyz=pts_flat,
-        **cfg["model"]["canonical"],
-    ).cuda()
-
-    deformation_head = CrossAttentionDeformationHead(
-        num_patches=dataset.num_patches,
-        num_gaussians_per_patch=K,
-        **cfg["model"]["deformation"],
-    ).cuda()
+    canonical_head, deformation_head = build_heads(cfg, dataset)
 
     writer = SummaryWriter(cfg["paths"]["log_dir"])
     g = 0

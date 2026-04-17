@@ -34,9 +34,10 @@ from pytorch_msssim import ssim as compute_ssim
 from aria_cached_dataset import AriaCachedDataset
 from aria_cameras import build_cameras_from_aria
 from aria_dataset import AriaSequenceDataset
-from model import HybridDPTCanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
+from model import compose_gaussians
 from renderer import render_gaussians
 from losses import compute_psnr
+from train import build_heads
 
 
 def build_splits(num_frames: int, protocol: str):
@@ -68,21 +69,7 @@ def evaluate(cfg_path: str, protocol: str, checkpoint_name: str = "stage3_final.
         target_resolution=(target_w, target_h),
     )
 
-    pts_mean = dataset.points_map.mean(dim=0)
-    pts_flat = pts_mean.reshape(-1, 3)
-    K = cfg["model"]["num_gaussians_per_patch"]
-
-    canonical_head = HybridDPTCanonicalGaussianHead(
-        num_patches=dataset.num_patches,
-        num_gaussians_per_patch=K,
-        init_xyz=pts_flat,
-        **cfg["model"]["canonical"],
-    ).cuda()
-    deformation_head = CrossAttentionDeformationHead(
-        num_patches=dataset.num_patches,
-        num_gaussians_per_patch=K,
-        **cfg["model"]["deformation"],
-    ).cuda()
+    canonical_head, deformation_head = build_heads(cfg, dataset)
 
     ckpt_path = os.path.join(cfg["paths"]["checkpoint_dir"], checkpoint_name)
     ckpt = torch.load(ckpt_path, weights_only=False)

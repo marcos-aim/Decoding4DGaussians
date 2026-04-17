@@ -27,8 +27,9 @@ model:
     dim_hidden: 1024
     sh_degree: 0
     dpt_dim: 512
-    grid_h: 36            # 504 / 14 (VGGT patch stride)
-    grid_w: 36
+    # grid_h/grid_w omitted: build_heads() derives them from the actual patch
+    # count P in the cached tokens. VGGT internally pads to 518×518 → P≈1374
+    # regardless of input resolution, so a fixed 36×36 would underflow.
   deformation:
     dim_canonical: 1024
     dim_tokens: 2048
