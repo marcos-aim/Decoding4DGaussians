@@ -3,6 +3,7 @@ channels:
   - nvidia
   - pytorch
   - conda-forge
+  - nodefaults   # block Anaconda defaults/main/r (avoids conda 26.x ToS prompt)
 dependencies:
   - python=3.10
   - pip
