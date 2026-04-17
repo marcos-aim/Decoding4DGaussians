@@ -21,8 +21,10 @@ conda env create -f experiments/overfit_aea_loc3/environment.aria-compare.yml ||
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
-# Build diff_gaussian_rasterization (required for our renderer)
-pip install --no-build-isolation ./4DGaussians/submodules/diff-gaussian-rasterization
+# Build diff_gaussian_rasterization (required for our renderer).
+# Submodule directory is depth-diff-gaussian-rasterization even though
+# the installed Python module is diff_gaussian_rasterization.
+pip install --no-build-isolation ./4DGaussians/submodules/depth-diff-gaussian-rasterization
 pip install --no-build-isolation ./4DGaussians/submodules/simple-knn
 
 # Download 4DGT pretrained checkpoint
