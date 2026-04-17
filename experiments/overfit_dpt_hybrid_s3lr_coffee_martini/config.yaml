@@ -1,0 +1,83 @@
+experiment:
+  name: overfit_dpt_hybrid_s3lr_coffee_martini
+  scene: coffee_martini
+  mode: cross_attention_deformation
+  # H2 baseline with one change: stage 3 lr 1e-4 -> 1e-5.
+  # Motivation: original H2 stage 3 opened at lr=1e-4 on a warm jointly-tuned model,
+  # causing immediate oscillation (25.61 dB at step 1K -> 24.52 dB at step 3K).
+  # Lowering 10x eliminates destabilization while keeping cosine's fast convergence
+  # in stages 1-2 that made H2 beat all exp-LR variants by ~2.5 dB.
+
+paths:
+  neu3d_scene: D:\DecodeGaussians\datasets\neu3d\coffee_martini
+  spatracker_root: D:\DecodeGaussians\SpaTrackerV2
+  cache_dir: D:\DecodeGaussians\experiments\overfit_coffee_martini\cache
+  checkpoint_dir: D:\DecodeGaussians\experiments\overfit_dpt_hybrid_s3lr_coffee_martini\checkpoints
+  render_dir: D:\DecodeGaussians\experiments\overfit_dpt_hybrid_s3lr_coffee_martini\renders
+  log_dir: D:\DecodeGaussians\experiments\overfit_dpt_hybrid_s3lr_coffee_martini\logs
+
+data:
+  resolution: [512, 384]
+  input_camera: cam01
+  eval_camera: cam00
+  num_frames: 300
+  precompute_window: 8
+
+model:
+  num_gaussians_per_patch: 128
+  canonical:
+    dim_in: 2048
+    dim_hidden: 1024
+    sh_degree: 0
+    dpt_dim: 512
+    grid_h: 28
+    grid_w: 38
+  deformation:
+    dim_canonical: 1024
+    dim_tokens: 2048
+    dim_hidden: 256
+    n_heads: 8
+    n_layers: 3
+    max_displacement: 2.0
+
+training:
+  batch_frames: 1
+  supervision_cams: 4
+  grad_clip_max_norm: 1.0
+  scale_anneal_target: 1.0
+  stage1:
+    steps: 20000
+    lr: 1.0e-3
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      geo: 0.1
+      depth: 0.0
+      scale_reg: 0.0
+      opacity_reg: 0.0
+  stage2:
+    steps: 20000
+    lr: 5.0e-4
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      tv: 0.01
+      scale_reg: 0.01
+      opacity_reg: 0.005
+  stage3:
+    steps: 10000
+    lr: 1.0e-5        # was 1e-4 in H2 baseline — 10x lower to prevent warm-model destabilization
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      tv: 0.005
+      scale_reg: 0.01
+      opacity_reg: 0.005
+  checkpointing:
+    save_every: 2000
+    render_every: 500
+
+vram:
+  total_gb: 12.0
+  warn_threshold_gb: 10.5
+  oom_retry: true
