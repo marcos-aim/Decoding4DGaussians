@@ -61,21 +61,39 @@ Do **not** add 4DGT to the repo's submodules — our scripts assume it is a sibl
 
 ## Step 2 — Environment
 
-There is a single dedicated conda env `aria-compare` for this experiment. Spec: `experiments/overfit_aea_loc3/environment.aria-compare.yml`. CUDA 12.4 / torch 2.4.1+cu124 / xformers 0.0.28 / flash-attn 2.6.3 / projectaria_tools 1.5.5 / gsplat 1.4.0.
+**Do NOT install into the shared `Decode4DGS` cluster env.** It has `numpy 2.x` (breaks `projectaria-tools<2`), `transformers 5.x` (breaks VGGT4Track's HF loader), and is missing `flash-attn` / `projectaria-tools` / `gsplat`. Build a **per-user** env instead — isolated, doesn't touch other cluster users.
 
-Run the bundled setup script (idempotent — creates env if missing, updates if present, builds diff-gaussian-rasterization from our 4DGaussians submodule, downloads the 4DGT pretrained checkpoint, and smoke-tests CUDA + projectaria_tools + VGGT4Track):
-
-```bash
-bash experiments/overfit_aea_loc3/scripts/setup_env.sh
-```
-
-Then activate:
+Pinned deps live at `experiments/overfit_aea_loc3/requirements.txt`. CUDA 12.4 / torch 2.4.1+cu124 / xformers 0.0.28 / flash-attn 2.6.3 / projectaria_tools 1.5.5 / gsplat 1.4.0.
 
 ```bash
+conda create -n aria-compare python=3.10 -y
 conda activate aria-compare
+conda install -c nvidia -c conda-forge cuda-toolkit=12.4 -y
+pip install -r experiments/overfit_aea_loc3/requirements.txt
+pip install --no-build-isolation ./4DGaussians/submodules/depth-diff-gaussian-rasterization
+pip install --no-build-isolation ./4DGaussians/submodules/simple-knn
 ```
 
-The 4DGT checkpoint will land at `4DGT/checkpoints/4dgt_full.pth` (≈2 GB).
+Then download the 4DGT pretrained checkpoint (≈2 GB, lands at `4DGT/checkpoints/4dgt_full.pth`):
+
+```bash
+cd 4DGT && python -m tlod.download_model && cd -
+```
+
+Sanity checks:
+
+```bash
+python -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', torch.cuda.get_device_name(0))"
+python -c "import projectaria_tools.core as pa; print('projectaria_tools OK')"
+python -c "
+import sys; sys.path.insert(0, 'SpaTrackerV2')
+from models.SpaTrackV2.models.vggt4track.models.vggt_moe import VGGT4Track
+m = VGGT4Track.from_pretrained('Yuxihenry/SpatialTrackerV2_Front')
+print('VGGT4Track OK')
+"
+```
+
+(The bundled `scripts/setup_env.sh` is the conda-YAML-driven version; it works too but assumes the Anaconda ToS is accepted and you're OK with a shared `aria-compare` env. Prefer the per-user requirements.txt path above on shared clusters.)
 
 ---
 
