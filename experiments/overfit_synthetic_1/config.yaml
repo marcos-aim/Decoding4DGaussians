@@ -1,0 +1,78 @@
+experiment:
+  name: overfit_synthetic_1
+  scene: synthetic_1
+  mode: aggregator_only
+
+paths:
+  neu3d_scene: /home/codyreeth/CameraExperiment/SyntheticCapture
+  spatracker_root: /home/codyreeth/Desktop/Decoding4DGaussians/SpaTrackerV2
+  cache_dir: /home/codyreeth/Desktop/Decoding4DGaussians/cached_datasets/cached_synthetic/synthetic_1
+  checkpoint_dir: /home/codyreeth/Desktop/Decoding4DGaussians/experiments/overfit_synthetic_1/checkpoints
+  render_dir: /home/codyreeth/Desktop/Decoding4DGaussians/experiments/overfit_synthetic_1/renders
+  log_dir: /home/codyreeth/Desktop/Decoding4DGaussians/experiments/overfit_synthetic_1/logs
+
+data:
+  resolution: [512, 288]  # W, H
+  input_camera: cam01
+  eval_camera: cam00
+  num_frames: 55
+  precompute_window: 8  # frames per STV2 forward pass
+
+model:
+  num_gaussians_per_patch: 128
+  canonical:
+    dim_in: 2048
+    dim_hidden: 1024
+    sh_degree: 0
+  deformation:
+    dim_in: 2048
+    dim_hidden: 256
+    n_attn_heads: 8
+    n_attn_layers: 2
+
+training:
+  batch_frames: 1
+  supervision_cams: 4
+  grad_clip_max_norm: 1.0
+  ssim_warmup_steps: 500
+  lpips_warmup_steps: 1000
+  stage1_supervision_cams: 4
+  scale_anneal_start: 5000
+  scale_anneal_target: 0.5
+  stage1:
+    steps: 20000
+    lr: 1.0e-3
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      geo: 0.1
+      depth: 0.0
+      scale_reg: 0.01
+      opacity_reg: 0.01
+      lpips: 0.0
+  stage2:
+    steps: 15000
+    lr: 1.0e-3
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      tv: 0.01
+      scale_reg: 0.01
+      opacity_reg: 0.01
+  stage3:
+    steps: 10000
+    lr: 5.0e-4
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      tv: 0.005
+      scale_reg: 0.01
+      opacity_reg: 0.01
+  checkpointing:
+    save_every: 2000
+    render_every: 500
+
+vram:
+  total_gb: 12.0
+  warn_threshold_gb: 10.5
+  oom_retry: true
