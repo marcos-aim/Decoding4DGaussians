@@ -49,11 +49,13 @@ training:
   stage2:
     steps: 20000
     lr: 5.0e-4
-    loss_weights: {rgb: 1.0, ssim: 0.85, tv: 0.01, scale_reg: 0.01, opacity_reg: 0.005}
+    # tv=0: TV compares consecutive-frame deltas; monocular loop samples one frame/step,
+    # so there's no meaningful pair. Re-enable after adding a 2-frame sampler.
+    loss_weights: {rgb: 1.0, ssim: 0.85, tv: 0.0, scale_reg: 0.01, opacity_reg: 0.005}
   stage3:
     steps: 10000
     lr: 1.0e-5
-    loss_weights: {rgb: 1.0, ssim: 0.85, tv: 0.005, scale_reg: 0.01, opacity_reg: 0.005}
+    loss_weights: {rgb: 1.0, ssim: 0.85, tv: 0.0, scale_reg: 0.01, opacity_reg: 0.005}
   checkpointing:
     save_every: 2000
     render_every: 500
