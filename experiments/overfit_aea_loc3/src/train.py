@@ -26,9 +26,8 @@ from aria_cameras import build_cameras_from_aria, AriaMiniCam
 from aria_dataset import AriaSequenceDataset
 from model import HybridDPTCanonicalGaussianHead, CrossAttentionDeformationHead, compose_gaussians
 from renderer import render_gaussians
-from losses import (compute_psnr, compute_rgb_loss, compute_ssim_loss,
-                    compute_geo_loss, compute_tv_loss,
-                    compute_scale_reg, compute_opacity_reg)
+from losses import (compute_psnr, photometric_loss, geometric_loss,
+                    scale_regularization, opacity_regularization)
 
 
 def build_input_indices(num_frames: int, input_subsample: int) -> list:
@@ -101,18 +100,19 @@ def train_one_stage(cfg, stage_name, canonical_head, deformation_head,
         )
         gt = dataset.load_frame_image(t_idx)
 
-        rgb_l = compute_rgb_loss(rendered, gt)
-        ssim_l = compute_ssim_loss(rendered, gt)
-        loss = lw.get("rgb", 0.0) * rgb_l + lw.get("ssim", 0.0) * ssim_l
+        # photometric_loss combines L1 + SSIM internally (lambda_ssim weights SSIM portion).
+        # Match reference s3lr: scale by lw["rgb"], pass lw["ssim"] as lambda_ssim.
+        loss = lw.get("rgb", 1.0) * photometric_loss(
+            rendered, gt, lambda_ssim=lw.get("ssim", 0.85)
+        )
         if lw.get("geo", 0.0) > 0:
-            loss = loss + lw["geo"] * compute_geo_loss(means3D, dataset.get_points_map_frame(t_idx))
-        if lw.get("tv", 0.0) > 0 and stage_name != "stage1":
-            tv_l = compute_tv_loss(means3D)
-            loss = loss + lw["tv"] * tv_l
+            loss = loss + lw["geo"] * geometric_loss(means3D, dataset.get_points_map_frame(t_idx))
+        # TV loss skipped: monocular loop samples ONE random frame per step, so there is
+        # no meaningful consecutive-frame pair. Reference s3lr tv_loss takes (deltas_t, deltas_t_prev).
         if lw.get("scale_reg", 0.0) > 0:
-            loss = loss + lw["scale_reg"] * compute_scale_reg(scales)
+            loss = loss + lw["scale_reg"] * scale_regularization(scales)
         if lw.get("opacity_reg", 0.0) > 0:
-            loss = loss + lw["opacity_reg"] * compute_opacity_reg(opacity)
+            loss = loss + lw["opacity_reg"] * opacity_regularization(opacity)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
