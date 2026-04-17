@@ -1,0 +1,85 @@
+experiment:
+  name: overfit_tier0_defensive_coffee_martini
+  scene: coffee_martini
+  mode: cross_attention_deformation
+  # Tier 0 defensive measures applied to H2 (best experiment at 25.71 dB):
+  #   1. Rendered output clamped [0,1] before loss (prevents gradient inflation)
+  #   2. Velocity regularization on dxyz (dead-zone enforcement)
+  #   3. Pre-rasterization opacity culling < 0.05 (renderer.py)
+  #   4. Scale init tied to 1/sqrt(H*W) via res_scale (already in baseline, confirmed)
+
+paths:
+  neu3d_scene: D:\DecodeGaussians\datasets\neu3d\coffee_martini
+  spatracker_root: D:\DecodeGaussians\SpaTrackerV2
+  cache_dir: D:\DecodeGaussians\experiments\overfit_coffee_martini\cache
+  checkpoint_dir: D:\DecodeGaussians\experiments\overfit_tier0_defensive_coffee_martini\checkpoints
+  render_dir: D:\DecodeGaussians\experiments\overfit_tier0_defensive_coffee_martini\renders
+  log_dir: D:\DecodeGaussians\experiments\overfit_tier0_defensive_coffee_martini\logs
+
+data:
+  resolution: [512, 384]
+  input_camera: cam01
+  eval_camera: cam00
+  num_frames: 300
+  precompute_window: 8
+
+model:
+  num_gaussians_per_patch: 128
+  canonical:
+    dim_in: 2048
+    dim_hidden: 1024
+    sh_degree: 0
+    dpt_dim: 512
+    grid_h: 28
+    grid_w: 38
+  deformation:
+    dim_canonical: 1024
+    dim_tokens: 2048
+    dim_hidden: 256
+    n_heads: 8
+    n_layers: 3
+    max_displacement: 2.0
+
+training:
+  batch_frames: 1
+  supervision_cams: 4
+  grad_clip_max_norm: 1.0
+  scale_anneal_target: 1.0
+  stage1:
+    steps: 20000
+    lr: 1.0e-3
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      geo: 0.1
+      depth: 0.0
+      scale_reg: 0.0
+      opacity_reg: 0.0
+  stage2:
+    steps: 20000
+    lr: 5.0e-4
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      tv: 0.01
+      scale_reg: 0.01
+      opacity_reg: 0.005
+      velocity_reg: 0.001  # Tier 0: dead-zone deformation penalty
+  stage3:
+    steps: 10000
+    lr: 1.0e-4
+    loss_weights:
+      rgb: 1.0
+      ssim: 0.85
+      tv: 0.005
+      scale_reg: 0.01
+      opacity_reg: 0.005
+      velocity_reg: 0.0005  # Tier 0: lighter in joint fine-tuning
+  checkpointing:
+    save_every: 2000
+    render_every: 500
+
+vram:
+  total_gb: 12.0
+  warn_threshold_gb: 10.5
+  oom_retry: true
